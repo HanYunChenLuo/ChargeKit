@@ -1,0 +1,63 @@
+name: Build & Release
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.app
+
+      - name: Build
+        run: swift build -c release
+
+      - name: Run tests (198 assertions)
+        run: swift run policy-tests
+
+      - name: Assemble .app bundle
+        if: startsWith(github.ref, 'refs/tags/')
+        run: ./scripts/build-app.sh
+
+      - name: Verify ad-hoc codesign
+        if: startsWith(github.ref, 'refs/tags/')
+        run: codesign --verify --verbose=2 build/ChargeKit.app
+
+      - name: Create DMG
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          STAGING="$(mktemp -d)"
+          cp -R build/ChargeKit.app "$STAGING/"
+          ln -s /Applications "$STAGING/Applications"
+          hdiutil create \
+            -volname "ChargeKit" \
+            -srcfolder "$STAGING" \
+            -ov \
+            -format UDZO \
+            "ChargeKit-${TAG}.dmg"
+          shasum -a 256 "ChargeKit-${TAG}.dmg" > "ChargeKit-${TAG}.dmg.sha256"
+
+      - name: Upload test artifacts
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChargeKit-app
+          path: build/ChargeKit.app
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ChargeKit-*.dmg
+            ChargeKit-*.dmg.sha256
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref, '-') }}
