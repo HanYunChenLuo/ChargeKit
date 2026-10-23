@@ -29,6 +29,7 @@ ChargeKit limits how high your MacBook charges, extends battery lifespan, and pr
 | Battery info | Design capacity, health %, cycle count, temperature, live power flow |
 | Hardware % | Toggle between macOS gauge and BMS-direct battery percentage |
 | Clamshell discharge | Discharge works with lid closed (automatic sleep prevention) |
+| Right-click menu | Menu-bar context menu: settings, about, and quit |
 
 ## How it works
 
