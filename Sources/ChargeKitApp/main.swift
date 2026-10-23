@@ -49,6 +49,7 @@ extension ChargePhase {
         switch self {
         case .idle: return "battery.100"
         case .charging: return "bolt.fill"
+        case .chargePaused: return "pause.circle"
         case .holding: return "battery.75"
         case .heatPaused: return "thermometer.high"
         case .discharging: return "arrow.down.circle.fill"
@@ -59,6 +60,7 @@ extension ChargePhase {
         switch self {
         case .idle: return .secondaryLabelColor
         case .charging: return .systemGreen
+        case .chargePaused: return .systemYellow
         case .holding: return .systemOrange
         case .heatPaused: return .systemRed
         case .discharging: return .systemBlue
@@ -303,6 +305,19 @@ final class BatteryInfoReader {
                   .takeRetainedValue() as? [String: Any] else { return nil }
         return raw
     }
+
+ /// True when the battery firmware reports a reason for not charging
+ /// (optimized charging, end-of-charge management, etc.).
+    static func chargePaused() -> Bool? {
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
+        guard service != 0 else { return nil }
+        defer { IOObjectRelease(service) }
+        guard let raw = IORegistryEntryCreateCFProperty(
+                  service, "ChargerData" as CFString, kCFAllocatorDefault, 0)?
+                  .takeRetainedValue() as? [String: Any],
+              let reason = raw["NotChargingReason"] as? Int else { return nil }
+        return reason != 0
+    }
 }
 
 // MARK: - MagSafe LED
@@ -481,6 +496,10 @@ final class ChargeEngine: ObservableObject {
         var chargingEnabled: Bool = true
         var phase: ChargePhase = .idle
         var readError: String?
+ /// macOS optimized-charging / native environment paused the charge
+ /// (ChargerData.NotChargingReason != 0) even though the SMC charging
+ /// switch is on.
+        var chargePaused: Bool = false
     }
 
     @Published var snapshot = Snapshot()
@@ -1251,6 +1270,7 @@ final class ChargeEngine: ObservableObject {
  // override below). NB: during a daemon discharge session IOPowerSources
  // also reports battery — the session branch below takes precedence.
         let acAttached = powerSources.acAttached
+        let batteryChargePaused = BatteryInfoReader.chargePaused() ?? false
 
  // Low Power Mode mirror (public read-only API; the daemon owns
  // writes). Skipped briefly after a local toggle so the optimistic
@@ -1498,14 +1518,17 @@ final class ChargeEngine: ObservableObject {
             dcInPower: power, batteryTemp: temp,
             batteryPower: batteryPower, hostPower: hostPower,
             batteryVolts: batteryVolts, batteryAmps: batteryAmps,
-            chargingEnabled: chargingOn, phase: decision.phase, readError: nil)
+            chargingEnabled: chargingOn, phase: decision.phase, readError: nil,
+            chargePaused: acAttached ? batteryChargePaused : false)
 
- // Without wall power the limiter is not actively doing anything and
- // the battery carries the machine — phase labels like "已停在 X%（适配器
- // 供电）" would be wrong. statusText separates this from a discharge
- // session via dischargeActive.
+// Without wall power the limiter is not actively doing anything and
+// the battery carries the machine — phase labels like "已停在 X%（适配器
+// 供电）" would be wrong. statusText separates this from a discharge
+// session via dischargeActive.
         if !acAttached {
             newSnapshot.phase = .discharging
+        } else if newSnapshot.phase == .charging, newSnapshot.chargePaused {
+            newSnapshot.phase = .chargePaused
         }
 
  // Limit-reached notification: only a charging leg that rose more
@@ -1698,8 +1721,10 @@ struct PopoverView: View {
             return "未限制充电"
         case .charging:
             return engine.topUpActive ? "充满中 → 100%" : "充电中 → \(engine.targetPercent)%"
+        case .chargePaused:
+            return "充电已暂停 · macOS 优化充电中"
         case .holding:
- // Current percent lives in the merged header gauge once; the
+// Current percent lives in the merged header gauge once; the
  // menu-bar title carries it too. Only the semantics stay here.
             return "已停在上限 · 适配器供电"
         case .heatPaused:
