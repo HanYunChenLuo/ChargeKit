@@ -2189,14 +2189,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func handleStatusButtonClick() {
-        if NSApp.currentEvent?.type == .rightMouseUp {
-            showStatusMenu()
+        guard let event = NSApp.currentEvent else { return }
+        if event.type == .rightMouseUp {
+            showStatusMenu(event)
         } else {
             togglePopover()
         }
     }
 
-    private func showStatusMenu() {
+    private func showStatusMenu(_ event: NSEvent) {
         guard let button = statusItem.button else { return }
         popover.performClose(nil)
 
@@ -2227,10 +2228,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         quitItem.target = NSApp
         menu.addItem(quitItem)
 
-        menu.popUp(
-            positioning: nil,
-            at: NSPoint(x: 0, y: button.bounds.height + 4),
-            in: button)
+        NSMenu.popUpContextMenu(menu, with: event, for: button)
     }
 
  /// Final-height sizing via the hidden measurer: called on every
