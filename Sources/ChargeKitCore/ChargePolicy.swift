@@ -41,13 +41,13 @@ public struct ChargeConfig: Equatable {
 }
 
 public enum ChargePhase: Equatable {
-/// Adapter on, charging toward the target.
+ /// Adapter on, charging toward the target.
     case charging
-/// Charging switch on but the battery is not taking current (macOS
-/// optimized charging / native pause). Never returned by ChargePolicy;
-/// the engine sets it from IORegistry's NotChargingReason.
+ /// Charging switch on but the battery is not taking current (macOS
+ /// optimized charging / native pause). Never returned by ChargePolicy;
+ /// the engine sets it from IORegistry's NotChargingReason.
     case chargePaused
-/// Target reached; charging off, adapter keeps powering (sailing).
+ /// Target reached; charging off, adapter keeps powering (sailing).
     case holding
  /// Battery at/above the heat threshold; charging off regardless of sailing.
     case heatPaused

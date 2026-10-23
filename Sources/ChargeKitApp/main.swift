@@ -1602,10 +1602,10 @@ final class ChargeEngine: ObservableObject {
             chargingEnabled: chargingOn, phase: decision.phase, readError: nil,
             chargePaused: acAttached ? batteryChargePaused : false)
 
-// Without wall power the limiter is not actively doing anything and
-// the battery carries the machine — phase labels like "已停在 X%（适配器
-// 供电）" would be wrong. statusText separates this from a discharge
-// session via dischargeActive.
+ // Without wall power the limiter is not actively doing anything and
+ // the battery carries the machine — phase labels like "已停在 X%（适配器
+ // 供电）" would be wrong. statusText separates this from a discharge
+ // session via dischargeActive.
         if !acAttached {
             newSnapshot.phase = .discharging
         } else if newSnapshot.phase == .charging, newSnapshot.chargePaused {
@@ -1805,7 +1805,7 @@ struct PopoverView: View {
         case .chargePaused:
             return "充电已暂停 · macOS 优化充电中"
         case .holding:
-// Current percent lives in the merged header gauge once; the
+ // Current percent lives in the merged header gauge once; the
  // menu-bar title carries it too. Only the semantics stay here.
             return "已停在上限 · 适配器供电"
         case .heatPaused:

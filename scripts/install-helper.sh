@@ -8,7 +8,7 @@ if [ -f "$SCRIPT_DIR/../Package.swift" ]; then
     SOURCE_BIN="${CHARGEKIT_SOURCE_BIN:-$REPO/.build/release/ChargeKitHelper}"
     APP_PATH="${CHARGEKIT_APP_PATH:-$REPO/build/ChargeKit.app}"
 else
- # Installed copy inside ChargeKit.app/Contents/Resources.
+    # Installed copy inside ChargeKit.app/Contents/Resources.
     APP_PATH="${CHARGEKIT_APP_PATH:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
     SOURCE_BIN="${CHARGEKIT_SOURCE_BIN:-$APP_PATH/Contents/Library/LaunchServices/ChargeKitHelper}"
 fi
