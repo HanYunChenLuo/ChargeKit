@@ -20,6 +20,11 @@ cat > "$PLIST" <<EOF
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>CHARGEKIT_APP_PATH</key>
+        <string>${CHARGEKIT_APP_PATH:-$REPO/build/ChargeKit.app}</string>
+    </dict>
     <key>Label</key>
     <string>com.chargekit.helper</string>
     <key>Program</key>
