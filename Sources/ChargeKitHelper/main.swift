@@ -10,6 +10,26 @@ import IOKit.ps
 
 let machServiceName = "com.chargekit.helper"
 let adapterKey = ChargeController.AdapterKey(rawValue: "CHIE")!
+let installedHelperBinary = "/Library/PrivilegedHelperTools/\(machServiceName)"
+let installedHelperPlist = "/Library/LaunchDaemons/\(machServiceName).plist"
+
+var chargeKitAppPaths: [String] = {
+    var paths = ["/Applications/ChargeKit.app"]
+    if let configured = ProcessInfo.processInfo.environment["CHARGEKIT_APP_PATH"],
+       !configured.isEmpty {
+        paths.insert(configured, at: 0)
+    }
+    return paths
+}()
+
+func chargeKitAppIsInstalled() -> Bool {
+    let fm = FileManager.default
+    return chargeKitAppPaths.contains { path in
+        var isDirectory: ObjCBool = false
+        return fm.fileExists(atPath: path, isDirectory: &isDirectory)
+            && isDirectory.boolValue
+    }
+}
 
 @objc public protocol HelperProtocol {
     func version(withReply reply: @escaping (String) -> Void)
@@ -349,8 +369,9 @@ final class HelperService: NSObject, HelperProtocol {
 /// Daemon restarts (reboot, reinstall) reset it to the safe default
 /// until the app reconnects.
 var exitRestoresCharging = true
+var uninstallingSelf = false
 
-func restoreAndExit(_ code: Int32) {
+func restoreState() {
     DischargeManager.shared.cancel()
     if let client = try? AppleSMCClient() {
         let controller = ChargeController(client: client)
@@ -365,7 +386,34 @@ func restoreAndExit(_ code: Int32) {
             _ = try? client.write(SMCKey("ACLC"), [0x00])
         }
     }
+}
+
+func restoreAndExit(_ code: Int32) {
+    restoreState()
     exit(code)
+}
+
+func deleteInstalledHelperFiles() {
+    let fm = FileManager.default
+    try? fm.removeItem(atPath: installedHelperPlist)
+    try? fm.removeItem(atPath: installedHelperBinary)
+}
+
+/// App removed → helper removes itself: restore state first, then ask
+/// launchd to boot the service out; the SIGTERM handler finishes the
+/// file cleanup before the process dies.
+func uninstallSelfIfAppMissing() {
+    guard !uninstallingSelf, !chargeKitAppIsInstalled() else { return }
+    NSLog("[ChargeKitHelper] ChargeKit.app missing — uninstalling helper")
+    uninstallingSelf = true
+    restoreState()
+
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+    p.arguments = ["bootout", "system/\(machServiceName)"]
+    p.standardOutput = FileHandle.nullDevice
+    p.standardError = FileHandle.nullDevice
+    try? p.run()
 }
 
 // signal handlers must be re-entrant; use DispatchSource
@@ -373,6 +421,10 @@ for sig in [SIGTERM, SIGINT, SIGHUP] {
     signal(sig, SIG_IGN)
     let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
     src.setEventHandler {
+        if uninstallingSelf {
+            deleteInstalledHelperFiles()
+            exit(0)
+        }
         NSLog("[ChargeKitHelper] signal \(sig) — restoring charging + adapter, exiting")
         restoreAndExit(0)
     }
@@ -391,6 +443,13 @@ NSLog("[ChargeKitHelper] listening on \(machServiceName)")
 DispatchQueue.global().async {
     while true {
         Thread.sleep(forTimeInterval: 60)
+        if !chargeKitAppIsInstalled() {
+            uninstallSelfIfAppMissing()
+            if uninstallingSelf {
+                deleteInstalledHelperFiles()
+                exit(0)
+            }
+        }
         if let c = try? AppleSMCClient(), (try? ChargeController(client: c).isAdapterEnabled()) != nil {
             continue
         }

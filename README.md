@@ -29,6 +29,7 @@ ChargeKit limits how high your MacBook charges, extends battery lifespan, and pr
 | Battery info | Design capacity, health %, cycle count, temperature, live power flow |
 | Hardware % | Toggle between macOS gauge and BMS-direct battery percentage |
 | Clamshell discharge | Discharge works with lid closed (automatic sleep prevention) |
+| Right-click menu | Menu-bar context menu: settings, about, and quit |
 
 ## How it works
 
@@ -63,12 +64,17 @@ swift build -c release
 # Run the test suite (198 assertions)
 swift run policy-tests
 
-# Install the privileged helper (one-time; requires sudo)
-sudo ./scripts/install-helper.sh
-
 # Build and launch the app
 ./scripts/build-app.sh
 open build/ChargeKit.app
+```
+
+The first launch installs the privileged helper from inside the app
+bundle (one-time administrator prompt). A manual fallback is still
+available:
+
+```bash
+sudo ./scripts/install-helper.sh
 ```
 
 The helper daemon can be uninstalled at any time:

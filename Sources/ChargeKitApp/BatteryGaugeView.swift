@@ -33,6 +33,7 @@ struct BatteryGaugeView: View {
         if lowPowerMode { return Self.lowPowerYellow }
         switch phase {
         case .charging, .idle: return .green
+        case .chargePaused: return .yellow
         case .holding: return .orange
         case .heatPaused: return .red
         case .discharging: return .blue

@@ -49,6 +49,7 @@ extension ChargePhase {
         switch self {
         case .idle: return "battery.100"
         case .charging: return "bolt.fill"
+        case .chargePaused: return "pause.circle"
         case .holding: return "battery.75"
         case .heatPaused: return "thermometer.high"
         case .discharging: return "arrow.down.circle.fill"
@@ -59,6 +60,7 @@ extension ChargePhase {
         switch self {
         case .idle: return .secondaryLabelColor
         case .charging: return .systemGreen
+        case .chargePaused: return .systemYellow
         case .holding: return .systemOrange
         case .heatPaused: return .systemRed
         case .discharging: return .systemBlue
@@ -174,6 +176,87 @@ final class HelperClient {
  /// defaults to restore (safe) until told otherwise.
     func setExitRestoresCharging(enabled: Bool, completion: @escaping (Error?) -> Void = { _ in }) {
         proxy?.setExitRestoresCharging(enabled: enabled, withReply: completion)
+    }
+}
+
+/// One-time privileged helper install from the app bundle. Runs the
+/// bundled install-helper.sh via AppleScript's administrator
+/// authorization so the LaunchDaemon and CHARGEKIT_APP_PATH stay in
+/// sync with the running app.
+final class HelperInstaller {
+    static let shared = HelperInstaller()
+
+    private let helperPath = "/Library/PrivilegedHelperTools/com.chargekit.helper"
+    private let daemonPlist = "/Library/LaunchDaemons/com.chargekit.helper.plist"
+    private let installerScriptName = "install-helper.sh"
+    private var installInProgress = false
+
+    private func error(_ message: String) -> NSError {
+        NSError(domain: "com.chargekit.installer", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: message])
+    }
+
+    private var needsInstall: Bool {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: helperPath),
+              fm.fileExists(atPath: daemonPlist),
+              let data = try? Data(contentsOf: URL(fileURLWithPath: daemonPlist)),
+              let object = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
+              let dict = object as? [String: Any],
+              let env = dict["EnvironmentVariables"] as? [String: Any],
+              let installedPath = env["CHARGEKIT_APP_PATH"] as? String,
+              let installedVersion = env["CHARGEKIT_APP_VERSION"] as? String,
+              let bundleVersion = Bundle.main.infoDictionary?["CFBundleVersion"] as? String
+        else { return true }
+        return installedPath != Bundle.main.bundlePath || installedVersion != bundleVersion
+    }
+
+    func installIfNeeded(completion: @escaping (Error?) -> Void) {
+        guard !installInProgress else { return }
+        if !needsInstall {
+            completion(nil)
+            return
+        }
+        installInProgress = true
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let result = self.runPrivilegedInstall()
+            self.installInProgress = false
+            DispatchQueue.main.async {
+                completion(result)
+            }
+        }
+    }
+
+    private func runPrivilegedInstall() -> Error? {
+        guard let resources = Bundle.main.resourceURL else {
+            return error("App bundle missing Resources")
+        }
+        let script = resources.appendingPathComponent(installerScriptName).path
+        guard FileManager.default.isExecutableFile(atPath: script) else {
+            return error("Bundled helper installer missing")
+        }
+
+        let escaped = script
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        let source = "do shell script \"/bin/sh \" & quoted form of \"\(escaped)\" with administrator privileges"
+
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        p.arguments = ["-e", source]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do {
+            try p.run()
+            p.waitUntilExit()
+        } catch {
+            return error
+        }
+        guard p.terminationStatus == 0 else {
+            return error("helper 安装未完成（可能取消了授权）")
+        }
+        return needsInstall ? error("helper 安装未生效") : nil
     }
 }
 
@@ -302,6 +385,19 @@ final class BatteryInfoReader {
                   service, "AdapterDetails" as CFString, kCFAllocatorDefault, 0)?
                   .takeRetainedValue() as? [String: Any] else { return nil }
         return raw
+    }
+
+ /// True when the battery firmware reports a reason for not charging
+ /// (optimized charging, end-of-charge management, etc.).
+    static func chargePaused() -> Bool? {
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
+        guard service != 0 else { return nil }
+        defer { IOObjectRelease(service) }
+        guard let raw = IORegistryEntryCreateCFProperty(
+                  service, "ChargerData" as CFString, kCFAllocatorDefault, 0)?
+                  .takeRetainedValue() as? [String: Any],
+              let reason = raw["NotChargingReason"] as? Int else { return nil }
+        return reason != 0
     }
 }
 
@@ -481,6 +577,10 @@ final class ChargeEngine: ObservableObject {
         var chargingEnabled: Bool = true
         var phase: ChargePhase = .idle
         var readError: String?
+ /// macOS optimized-charging / native environment paused the charge
+ /// (ChargerData.NotChargingReason != 0) even though the SMC charging
+ /// switch is on.
+        var chargePaused: Bool = false
     }
 
     @Published var snapshot = Snapshot()
@@ -1251,6 +1351,7 @@ final class ChargeEngine: ObservableObject {
  // override below). NB: during a daemon discharge session IOPowerSources
  // also reports battery — the session branch below takes precedence.
         let acAttached = powerSources.acAttached
+        let batteryChargePaused = BatteryInfoReader.chargePaused() ?? false
 
  // Low Power Mode mirror (public read-only API; the daemon owns
  // writes). Skipped briefly after a local toggle so the optimistic
@@ -1498,7 +1599,8 @@ final class ChargeEngine: ObservableObject {
             dcInPower: power, batteryTemp: temp,
             batteryPower: batteryPower, hostPower: hostPower,
             batteryVolts: batteryVolts, batteryAmps: batteryAmps,
-            chargingEnabled: chargingOn, phase: decision.phase, readError: nil)
+            chargingEnabled: chargingOn, phase: decision.phase, readError: nil,
+            chargePaused: acAttached ? batteryChargePaused : false)
 
  // Without wall power the limiter is not actively doing anything and
  // the battery carries the machine — phase labels like "已停在 X%（适配器
@@ -1506,6 +1608,8 @@ final class ChargeEngine: ObservableObject {
  // session via dischargeActive.
         if !acAttached {
             newSnapshot.phase = .discharging
+        } else if newSnapshot.phase == .charging, newSnapshot.chargePaused {
+            newSnapshot.phase = .chargePaused
         }
 
  // Limit-reached notification: only a charging leg that rose more
@@ -1698,6 +1802,8 @@ struct PopoverView: View {
             return "未限制充电"
         case .charging:
             return engine.topUpActive ? "充满中 → 100%" : "充电中 → \(engine.targetPercent)%"
+        case .chargePaused:
+            return "充电已暂停 · macOS 优化充电中"
         case .holding:
  // Current percent lives in the merged header gauge once; the
  // menu-bar title carries it too. Only the semantics stay here.
@@ -2021,7 +2127,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
-            button.action = #selector(togglePopover)
+            button.action = #selector(handleStatusButtonClick)
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
             button.target = self
         }
 
@@ -2032,6 +2139,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.updateStatusBar(snapshot)
             }
             .store(in: &cancellables)
+
+ // Ensure the root helper is installed; one-time admin prompt.
+        HelperInstaller.shared.installIfNeeded { error in
+            if let error {
+                NSLog("[ChargeKit] helper install failed: \(error.localizedDescription)")
+            }
+        }
 
         engine.start()
     }
@@ -2185,6 +2299,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKey()
         }
+    }
+
+    @objc private func handleStatusButtonClick() {
+        guard let event = NSApp.currentEvent else { return }
+        if event.type == .rightMouseUp {
+            showStatusMenu(event)
+        } else {
+            togglePopover()
+        }
+    }
+
+    private func showStatusMenu(_ event: NSEvent) {
+        guard let button = statusItem.button else { return }
+        popover.performClose(nil)
+
+        let menu = NSMenu()
+
+        let settingsItem = NSMenuItem(
+            title: "设置…",
+            action: #selector(openSettingsFromMenu),
+            keyEquivalent: "")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
+
+        menu.addItem(.separator())
+
+        let aboutItem = NSMenuItem(
+            title: "关于 ChargeKit",
+            action: #selector(showAbout),
+            keyEquivalent: "")
+        aboutItem.target = self
+        menu.addItem(aboutItem)
+
+        menu.addItem(.separator())
+
+        let quitItem = NSMenuItem(
+            title: "退出 ChargeKit",
+            action: #selector(NSApplication.terminate(_:)),
+            keyEquivalent: "q")
+        quitItem.target = NSApp
+        menu.addItem(quitItem)
+
+        NSMenu.popUpContextMenu(menu, with: event, for: button)
     }
 
  /// Final-height sizing via the hidden measurer: called on every
