@@ -179,6 +179,87 @@ final class HelperClient {
     }
 }
 
+/// One-time privileged helper install from the app bundle. Runs the
+/// bundled install-helper.sh via AppleScript's administrator
+/// authorization so the LaunchDaemon and CHARGEKIT_APP_PATH stay in
+/// sync with the running app.
+final class HelperInstaller {
+    static let shared = HelperInstaller()
+
+    private let helperPath = "/Library/PrivilegedHelperTools/com.chargekit.helper"
+    private let daemonPlist = "/Library/LaunchDaemons/com.chargekit.helper.plist"
+    private let installerScriptName = "install-helper.sh"
+    private var installInProgress = false
+
+    private func error(_ message: String) -> NSError {
+        NSError(domain: "com.chargekit.installer", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: message])
+    }
+
+    private var needsInstall: Bool {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: helperPath),
+              fm.fileExists(atPath: daemonPlist),
+              let data = try? Data(contentsOf: URL(fileURLWithPath: daemonPlist)),
+              let object = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
+              let dict = object as? [String: Any],
+              let env = dict["EnvironmentVariables"] as? [String: Any],
+              let installedPath = env["CHARGEKIT_APP_PATH"] as? String,
+              let installedVersion = env["CHARGEKIT_APP_VERSION"] as? String,
+              let bundleVersion = Bundle.main.infoDictionary?["CFBundleVersion"] as? String
+        else { return true }
+        return installedPath != Bundle.main.bundlePath || installedVersion != bundleVersion
+    }
+
+    func installIfNeeded(completion: @escaping (Error?) -> Void) {
+        guard !installInProgress else { return }
+        if !needsInstall {
+            completion(nil)
+            return
+        }
+        installInProgress = true
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let result = self.runPrivilegedInstall()
+            self.installInProgress = false
+            DispatchQueue.main.async {
+                completion(result)
+            }
+        }
+    }
+
+    private func runPrivilegedInstall() -> Error? {
+        guard let resources = Bundle.main.resourceURL else {
+            return error("App bundle missing Resources")
+        }
+        let script = resources.appendingPathComponent(installerScriptName).path
+        guard FileManager.default.isExecutableFile(atPath: script) else {
+            return error("Bundled helper installer missing")
+        }
+
+        let escaped = script
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        let source = "do shell script \"/bin/sh \" & quoted form of \"\(escaped)\" with administrator privileges"
+
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        p.arguments = ["-e", source]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do {
+            try p.run()
+            p.waitUntilExit()
+        } catch {
+            return error
+        }
+        guard p.terminationStatus == 0 else {
+            return error("helper 安装未完成（可能取消了授权）")
+        }
+        return needsInstall ? error("helper 安装未生效") : nil
+    }
+}
+
 // MARK: - Charge engine (heat + sailing policy layers, charging-switch mode)
 
 /// IOPowerSources reports the internal battery's Type as this value.
@@ -2058,6 +2139,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.updateStatusBar(snapshot)
             }
             .store(in: &cancellables)
+
+ // Ensure the root helper is installed; one-time admin prompt.
+        HelperInstaller.shared.installIfNeeded { error in
+            if let error {
+                NSLog("[ChargeKit] helper install failed: \(error.localizedDescription)")
+            }
+        }
 
         engine.start()
     }

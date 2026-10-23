@@ -64,12 +64,17 @@ swift build -c release
 # Run the test suite (198 assertions)
 swift run policy-tests
 
-# Install the privileged helper (one-time; requires sudo)
-sudo ./scripts/install-helper.sh
-
 # Build and launch the app
 ./scripts/build-app.sh
 open build/ChargeKit.app
+```
+
+The first launch installs the privileged helper from inside the app
+bundle (one-time administrator prompt). A manual fallback is still
+available:
+
+```bash
+sudo ./scripts/install-helper.sh
 ```
 
 The helper daemon can be uninstalled at any time:

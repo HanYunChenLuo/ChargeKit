@@ -9,7 +9,7 @@ BIN="$REPO/.build/release/ChargeKitApp"
 [ -x "$BIN" ] || { echo "build first: swift build -c release"; exit 1; }
 
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Library/LaunchServices"
 
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -39,6 +39,13 @@ cat > "$APP/Contents/Info.plist" <<EOF
 EOF
 
 cp "$BIN" "$APP/Contents/MacOS/ChargeKitApp"
+
+# Helper payload: embedded in the app bundle so the app can install or
+# refresh the LaunchDaemon from its own resources.
+HELPER_BIN="$REPO/.build/release/ChargeKitHelper"
+[ -x "$HELPER_BIN" ] || { echo "build first: swift build -c release"; exit 1; }
+cp "$HELPER_BIN" "$APP/Contents/Library/LaunchServices/ChargeKitHelper"
+cp "$REPO/scripts/install-helper.sh" "$APP/Contents/Resources/install-helper.sh"
 
 # App icon (single dual-mode-friendly icon; see make-icon.sh for the
 # appearance-variant constraint).
