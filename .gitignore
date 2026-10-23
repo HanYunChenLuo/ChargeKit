@@ -1,0 +1,30 @@
+# Build artifacts
+.build/
+build/
+DerivedData/
+
+# Swift Package Manager
+.swiftpm/
+Package.resolved
+
+# macOS
+.DS_Store
+*.dSYM
+*.dSYM.zip
+
+# Xcode (if ever opened)
+*.xcuserstate
+xcuserdata/
+*.xcworkspace
+*.xcodeproj
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+
+# Temp files
+*.tmp
+*.bak
+*.orig
