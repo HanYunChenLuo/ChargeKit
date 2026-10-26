@@ -2010,6 +2010,102 @@ private struct CardBackground: ViewModifier {
     }
 }
 
+private struct AboutView: View {
+    let appVersion: String
+    let build: String
+    let showDiagnostics: (String) -> Void
+    @State private var helperVersion: String?
+    @State private var isHelperVersionLoaded = false
+
+    private var displayedHelperVersion: String {
+        guard isHelperVersionLoaded else { return "检测中…" }
+        return helperVersion ?? "未安装或不可用"
+    }
+
+    private var macOSVersion: String {
+        let version = ProcessInfo.processInfo.operatingSystemVersion
+        let patch = version.patchVersion == 0 ? "" : ".\(version.patchVersion)"
+        return "macOS \(version.majorVersion).\(version.minorVersion)\(patch)"
+    }
+
+    private var diagnosticsText: String {
+        """
+        ChargeKit \(appVersion) (Build \(build))
+        Helper \(displayedHelperVersion)
+        \(macOSVersion)
+        """
+    }
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Image(nsImage: NSImage(named: NSImage.applicationIconName) ?? NSImage())
+                .resizable()
+                .frame(width: 96, height: 96)
+
+            VStack(spacing: 6) {
+                Text("ChargeKit")
+                    .font(.title2.weight(.semibold))
+                Text("\(appVersion) · Helper \(displayedHelperVersion)")
+                    .font(.callout)
+                    .foregroundColor(.secondary)
+            }
+
+            VStack(spacing: 8) {
+                Text("延长 MacBook 电池寿命的充电限制工具")
+                    .font(.callout)
+                    .foregroundColor(.secondary)
+                Link(
+                    "https://github.com/HanYunChenLuo/ChargeKit",
+                    destination: URL(string: "https://github.com/HanYunChenLuo/ChargeKit")!)
+                    .font(.callout)
+            }
+
+            Button("诊断信息") {
+                showDiagnostics(diagnosticsText)
+            }
+            .buttonStyle(.bordered)
+        }
+        .padding(24)
+        .frame(width: 340)
+        .onAppear(perform: refreshHelperVersion)
+    }
+
+    private func refreshHelperVersion() {
+        HelperClient.shared.version { version in
+            DispatchQueue.main.async {
+                helperVersion = version
+                isHelperVersionLoaded = true
+            }
+        }
+    }
+}
+
+private struct DiagnosticsView: View {
+    let text: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("诊断信息")
+                .font(.headline)
+            ScrollView {
+                Text(text)
+                    .font(.system(.body, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            HStack {
+                Spacer()
+                Button("关闭") {
+                    NSApp.keyWindow?.performClose(nil)
+                }
+                    .keyboardShortcut(.cancelAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 420, height: 300)
+    }
+}
+
 /// Popover root: a ScrollView that greedily fills whatever contentSize
 /// AppDelegate assigns to the popover (measured final content height, capped
 /// to the anchoring screen's visible frame — never covers the menu bar,
@@ -2098,6 +2194,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let engine = ChargeEngine()
     private var popover = NSPopover()
     private var settingsWindowController: SettingsWindowController?
+    private var aboutWindow: NSWindow?
+    private var diagnosticsWindow: NSWindow?
     private var cancellables: Set<AnyCancellable> = []
     private var anchorScreen: NSScreen?
  /// Hidden off-window controller holding the plain content VStack; its
@@ -2373,7 +2471,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc @MainActor
     private func showAbout() {
-        NSApp.orderFrontStandardAboutPanel(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? ""
+        if aboutWindow == nil {
+            let contentController = NSHostingController(rootView: AboutView(
+                appVersion: version,
+                build: build,
+                showDiagnostics: { [weak self] text in
+                    self?.showDiagnosticsWindow(text)
+                }))
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 340, height: 350),
+                styleMask: [.titled, .closable],
+                backing: .buffered,
+                defer: false)
+            window.title = "关于 ChargeKit"
+            window.isReleasedWhenClosed = false
+            window.contentViewController = contentController
+            aboutWindow = window
+        }
+        aboutWindow?.center()
+        aboutWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    @MainActor
+    private func showDiagnosticsWindow(_ text: String) {
+        if diagnosticsWindow == nil {
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 420, height: 300),
+                styleMask: [.titled, .closable],
+                backing: .buffered,
+                defer: false)
+            window.title = "诊断信息"
+            window.isReleasedWhenClosed = false
+            window.contentViewController = NSHostingController(
+                rootView: DiagnosticsView(text: text))
+            diagnosticsWindow = window
+        } else if let controller = diagnosticsWindow?.contentViewController
+            as? NSHostingController<DiagnosticsView> {
+            controller.rootView = DiagnosticsView(text: text)
+        }
+        diagnosticsWindow?.center()
+        diagnosticsWindow?.makeKeyAndOrderFront(nil)
     }
 
     @objc @MainActor
@@ -2458,6 +2598,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             keyEquivalent: "")
         aboutItem.target = self
         menu.addItem(aboutItem)
+
+        let updateItem = NSMenuItem(
+            title: "检查更新…",
+            action: #selector(checkForUpdates(_:)),
+            keyEquivalent: "")
+        updateItem.target = self
+        menu.addItem(updateItem)
 
         menu.addItem(.separator())
 
