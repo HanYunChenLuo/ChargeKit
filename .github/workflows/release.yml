@@ -21,7 +21,7 @@ jobs:
       - name: Build
         run: swift build -c release
 
-      - name: Run tests (198 assertions)
+      - name: Run tests (210 assertions)
         run: swift run policy-tests
 
       - name: Assemble .app bundle
