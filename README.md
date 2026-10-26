@@ -26,7 +26,7 @@ ChargeKit limits how high your MacBook charges, extends battery lifespan, and pr
 | Notifications | Limit reached, top-up done, discharge done, calibration done |
 | Schedule | 7 action types × 7 repeat modes, with catch-up after sleep |
 | Task history | Complete audit trail of every action, session, and state change |
-| Battery info | Design capacity, health %, cycle count, temperature, live power flow |
+| Battery info | Design capacity, health %, cycle count, temperature, live power flow, smoothed runtime estimate |
 | Hardware % | Toggle between macOS gauge and BMS-direct battery percentage |
 | Clamshell discharge | Discharge works with lid closed (automatic sleep prevention) |
 | Right-click menu | Menu-bar context menu: settings, about, and quit |

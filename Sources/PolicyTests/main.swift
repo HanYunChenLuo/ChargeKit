@@ -733,6 +733,69 @@ do {
         on: t(2026, 3, 2), repeatMode: .never, calendar: cal))
 }
 
+// MARK: - Runtime estimate
+
+do {
+ // Warm-up gate: no estimate until warmupTicks discharge samples.
+    var est = RuntimeEstimator(timeConstant: 30, warmupTicks: 3, minDischargeWatts: 0.5)
+    est.addSample(batteryPower: -10, dt: 2)
+    est.addSample(batteryPower: -10, dt: 2)
+    check("runtime: hidden during warm-up",
+          est.estimatedMinutes(remainingMah: 6000, voltage: 12) == nil)
+    est.addSample(batteryPower: -10, dt: 2)
+ // 6000 mAh × 12 V = 72 Wh at a steady 10 W = 432 min (the seed sample
+ // is exact, no EMA blending yet).
+    let steady = est.estimatedMinutes(remainingMah: 6000, voltage: 12)
+    check("runtime: published after warm-up", steady != nil)
+    check("runtime: steady-draw math", steady.map { abs($0 - 432) < 0.001 } ?? false)
+
+ // A charging / adapter-hold sample (power ≥ −0.5 W) clears the filter…
+    est.addSample(batteryPower: 0, dt: 2)
+    check("runtime: adapter-hold sample clears",
+          est.estimatedMinutes(remainingMah: 6000, voltage: 12) == nil)
+ // …and re-entering discharge needs the full warm-up again.
+    est.addSample(batteryPower: -10, dt: 2)
+    check("runtime: re-warm after reset",
+          est.estimatedMinutes(remainingMah: 6000, voltage: 12) == nil)
+
+ // Sub-threshold draws (noise / light hold) never publish and reset.
+    var noise = RuntimeEstimator(timeConstant: 30, warmupTicks: 2, minDischargeWatts: 0.5)
+    noise.addSample(batteryPower: -0.4, dt: 2)
+    noise.addSample(batteryPower: -0.4, dt: 2)
+    check("runtime: sub-watt draw stays hidden",
+          noise.estimatedMinutes(remainingMah: 6000, voltage: 12) == nil)
+    check("runtime: sub-watt draw resets filter", noise.emaWatts == nil)
+
+ // Missing inputs never fabricate a number.
+    var warm = RuntimeEstimator(timeConstant: 30, warmupTicks: 1, minDischargeWatts: 0.5)
+    warm.addSample(batteryPower: -10, dt: 2)
+    check("runtime: missing capacity hidden",
+          warm.estimatedMinutes(remainingMah: nil, voltage: 12) == nil)
+    check("runtime: missing voltage hidden",
+          warm.estimatedMinutes(remainingMah: 6000, voltage: nil) == nil)
+    check("runtime: zero remaining hidden",
+          warm.estimatedMinutes(remainingMah: 0, voltage: 12) == nil)
+
+ // A single 60 W spike against a 5 W baseline must not be tracked
+ // verbatim (τ = 30 s, dt = 2 s → α ≈ 0.0645; blended ≈ 8.5 W).
+    var spike = RuntimeEstimator(timeConstant: 30, warmupTicks: 1, minDischargeWatts: 0.5)
+    spike.addSample(batteryPower: -5, dt: 2)
+    spike.addSample(batteryPower: -60, dt: 2)
+    let spiked = spike.estimatedMinutes(remainingMah: 6000, voltage: 12)
+ // 72 min at a steady 60 W, 864 min at 5 W — strictly between.
+    check("runtime: spike smoothed, not tracked",
+          spiked.map { $0 > 72 && $0 < 864 } ?? false)
+
+ // EMA converges to a sustained draw once the seed ages out.
+    var settle = RuntimeEstimator(timeConstant: 30, warmupTicks: 1, minDischargeWatts: 0.5)
+    settle.addSample(batteryPower: -60, dt: 2)
+    for _ in 0..<80 { settle.addSample(batteryPower: -10, dt: 2) }
+    let settled = settle.estimatedMinutes(remainingMah: 6000, voltage: 12)
+ // |ema| ∈ (9, 11) W → minutes ∈ (392.7, 480).
+    check("runtime: converges to sustained draw",
+          settled.map { $0 > 392 && $0 < 481 } ?? false)
+}
+
 // MARK: - Summary
 
 print("\(passed) passed, \(failed) failed")
