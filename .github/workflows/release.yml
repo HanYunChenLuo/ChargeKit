@@ -55,7 +55,7 @@ jobs:
             .build/artifacts/sparkle/Sparkle/bin/generate_appcast \
               --ed-key-file - \
               --download-url-prefix "https://github.com/HanYunChenLuo/ChargeKit/releases/download/${TAG}/" \
-              build/
+              .
 
       - name: Upload test artifacts
         if: github.event_name == 'pull_request'
@@ -71,7 +71,7 @@ jobs:
           files: |
             ChargeKit-*.dmg
             ChargeKit-*.dmg.sha256
-            build/appcast.xml
+            appcast.xml
           generate_release_notes: true
           draft: false
           prerelease: ${{ contains(github.ref, '-') }}
