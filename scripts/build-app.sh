@@ -34,8 +34,6 @@ cat > "$APP/Contents/Info.plist" <<EOF
     <string>https://github.com/HanYunChenLuo/ChargeKit/releases/latest/download/appcast.xml</string>
     <key>SUPublicEDKey</key>
     <string>MUS+AOtobGIonWlNPzu9eoUVL9VbfekRRARYmJ9o394=</string>
-    <key>SUEnableAutomaticChecks</key>
-    <true/>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>NSPrincipalClass</key>

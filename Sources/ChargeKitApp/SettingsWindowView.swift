@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import ChargeKitCore
+import Sparkle
 
 private enum SettingsPane: String, CaseIterable {
     case charging
@@ -31,14 +32,16 @@ private enum SettingsPane: String, CaseIterable {
 @MainActor
 final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
     private let engine: ChargeEngine
+    private let updater: SPUUpdater
     private let contentController: NSHostingController<SettingsPaneView>
     private var selectedPane: SettingsPane
 
     private static let toolbarIdentifier = NSToolbar.Identifier("com.chargekit.settings")
     private static let selectedPaneKey = "chargekit.settingsPane"
 
-    init(engine: ChargeEngine) {
+    init(engine: ChargeEngine, updater: SPUUpdater) {
         self.engine = engine
+        self.updater = updater
         let savedPane = UserDefaults.standard.string(forKey: Self.selectedPaneKey)
             .flatMap(SettingsPane.init(rawValue:))
         selectedPane = savedPane ?? .charging
@@ -58,7 +61,7 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
         window.isReleasedWhenClosed = false
         window.title = "\(selectedPane.title)设置"
         let contentController = NSHostingController(
-            rootView: SettingsPaneView(engine: engine, pane: selectedPane))
+            rootView: SettingsPaneView(engine: engine, updater: updater, pane: selectedPane))
         self.contentController = contentController
         window.contentViewController = contentController
 
@@ -142,7 +145,7 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
         }
         guard let window else { return }
         let frame = window.frame
-        contentController.rootView = SettingsPaneView(engine: engine, pane: pane)
+        contentController.rootView = SettingsPaneView(engine: engine, updater: updater, pane: pane)
         window.title = "\(pane.title)设置"
  // Reuse the installed controller and preserve the complete frame.
  // Replacing contentViewController reattaches the host view and can
@@ -153,6 +156,7 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
 
 private struct SettingsPaneView: View {
     @ObservedObject var engine: ChargeEngine
+    let updater: SPUUpdater
     let pane: SettingsPane
 
  /// Semantic color for the live heat reading: green in the safe band,
@@ -427,6 +431,10 @@ private struct SettingsPaneView: View {
                 }
                 Toggle("通知", isOn: $engine.notificationsEnabled)
                     .help("达到上限、充满、放电或校准完成，以及系统上限阻止充满时提醒")
+                Toggle("自动检查更新", isOn: Binding(
+                    get: { updater.automaticallyChecksForUpdates },
+                    set: { updater.automaticallyChecksForUpdates = $0 }))
+                    .help("定期检查 ChargeKit 新版本并在后台下载；应用菜单中的“检查更新…”始终可用")
             }
         }
         .formStyle(.grouped)

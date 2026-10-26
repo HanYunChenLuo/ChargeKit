@@ -2014,6 +2014,55 @@ private struct CardBackground: ViewModifier {
 /// AppDelegate assigns to the popover (measured final content height, capped
 /// to the anchoring screen's visible frame — never covers the menu bar,
 /// never runs off the bottom; overflow scrolls).
+ /// First-run auto-update confirmation: one headline, one short line,
+ /// two buttons — no NSAlert chrome (empty buttons / suppression box).
+private struct AutoUpdatePromptView: View {
+    let choice: (_ enabled: Bool, _ remindLater: Bool) -> Void
+    @State private var declined = false
+
+    var body: some View {
+        Group {
+            if declined {
+                VStack(spacing: 16) {
+                    VStack(spacing: 5) {
+                        Text("以后要再次提醒吗？")
+                            .font(.headline)
+                        Text("仍可随时在设置中开启")
+                            .font(.callout)
+                            .foregroundColor(.secondary)
+                    }
+                    HStack(spacing: 12) {
+                        Button("不再提醒") { choice(false, false) }
+                            .keyboardShortcut(.cancelAction)
+                        Button("下次提醒") { choice(false, true) }
+                            .keyboardShortcut(.defaultAction)
+                            .buttonStyle(.borderedProminent)
+                    }
+                }
+            } else {
+                VStack(spacing: 16) {
+                    VStack(spacing: 5) {
+                        Text("启用自动检查更新？")
+                            .font(.headline)
+                        Text("有新版本时自动下载")
+                            .font(.callout)
+                            .foregroundColor(.secondary)
+                    }
+                    HStack(spacing: 12) {
+                        Button("不启用") { declined = true }
+                            .keyboardShortcut(.cancelAction)
+                        Button("启用") { choice(true, false) }
+                            .keyboardShortcut(.defaultAction)
+                            .buttonStyle(.borderedProminent)
+                    }
+                }
+            }
+        }
+        .padding(22)
+        .frame(width: 300)
+    }
+}
+
 struct PopoverRootView: View {
     @ObservedObject var engine: ChargeEngine
     var onBatteryInfoToggled: (@MainActor () -> Void)? = nil
@@ -2042,7 +2091,8 @@ private struct BatteryInfoHeightKey: PreferenceKey {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let updaterController = SPUStandardUpdaterController(
-        startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+        startingUpdater: false, updaterDelegate: nil, userDriverDelegate: nil)
+    private var autoUpdatePromptWindow: NSWindow?
 
     private var statusItem: NSStatusItem!
     private let engine = ChargeEngine()
@@ -2171,13 +2221,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         engine.start()
+
+        DispatchQueue.main.async { [weak self] in
+            self?.startUpdaterWithFirstRunPrompt()
+        }
+    }
+
+    private func startUpdaterWithFirstRunPrompt() {
+        if UserDefaults.standard.bool(forKey: "chargekit.autoUpdatePromptShown") {
+            updaterController.startUpdater()
+            return
+        }
+
+ // Hand-rolled NSPanel: a manually shown NSAlert.window leaks odd
+ // controls (empty third button, suppression checkbox), and runModal
+ // starves the engine tick. A tiny non-modal window is clean and safe.
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 300, height: 150),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false)
+        window.title = "自动更新"
+        window.isReleasedWhenClosed = false
+        window.level = .floating
+        window.contentViewController = NSHostingController(
+            rootView: AutoUpdatePromptView { [weak self] enabled, remindLater in
+                self?.autoUpdatePromptChoice(enabled: enabled, remindLater: remindLater)
+            })
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        autoUpdatePromptWindow = window
+    }
+
+    private func autoUpdatePromptChoice(enabled: Bool, remindLater: Bool) {
+        updaterController.updater.automaticallyChecksForUpdates = enabled
+        if enabled || !remindLater {
+            UserDefaults.standard.set(true, forKey: "chargekit.autoUpdatePromptShown")
+        }
+        autoUpdatePromptWindow?.orderOut(nil)
+        autoUpdatePromptWindow = nil
+        updaterController.startUpdater()
     }
 
     @MainActor
     private func showSettings() {
         popover.performClose(nil)
         if settingsWindowController == nil {
-            settingsWindowController = SettingsWindowController(engine: engine)
+            settingsWindowController = SettingsWindowController(
+                engine: engine, updater: updaterController.updater)
         }
         NSApp.activate(ignoringOtherApps: true)
  // Reopen on the screen the status item lives on, like system
