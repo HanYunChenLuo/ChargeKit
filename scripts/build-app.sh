@@ -27,9 +27,9 @@ cat > "$APP/Contents/Info.plist" <<EOF
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.5.0</string>
+    <string>0.5.1</string>
     <key>CFBundleVersion</key>
-    <string>6</string>
+    <string>7</string>
     <key>SUFeedURL</key>
     <string>https://github.com/HanYunChenLuo/ChargeKit/releases/latest/download/appcast.xml</string>
     <key>SUPublicEDKey</key>
