@@ -49,8 +49,24 @@ All reads are unprivileged; writes go through the root daemon with a whitelist o
 ## Requirements
 
 - macOS 13 Ventura or later
-- Apple Silicon MacBook (Intel path uses BCLM, untested)
+- Apple Silicon MacBook
 - Xcode Command Line Tools (Swift 6+)
+
+## Download & Install
+
+1. Download the latest `ChargeKit-vX.Y.Z.dmg` from
+   [Releases](https://github.com/HanYunChenLuo/ChargeKit/releases/latest)
+2. Open the DMG and drag **ChargeKit** into `/Applications`
+3. First launch — macOS Gatekeeper will warn that the app is from an
+   unidentified developer (the app is ad-hoc signed). Allow it once:
+   - **macOS 15+**: open the blocked app once from
+     *System Settings → Privacy & Security → Open Anyway*
+   - **macOS 13/14**: right-click the app → **Open** → **Open**
+4. On first launch, approve the administrator prompt once to install
+   the privileged helper (required for SMC charge control)
+
+After the first launch, updates are delivered automatically through
+Sparkle — no further Gatekeeper prompts are needed.
 
 ## Build & Install
 
