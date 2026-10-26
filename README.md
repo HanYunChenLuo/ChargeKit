@@ -113,6 +113,11 @@ sudo ./scripts/uninstall-helper.sh
 - SMC writes are whitelisted to charge-control keys (`CHTE`, `CHIE`, `BCLM`, etc.)
 - The helper daemon restores charging + adapter on every exit path (SIGTERM, crash, uninstall)
 - The XPC connection currently validates PID only (no code-signing verification) — suitable for single-user machines; audit-token verification is planned for multi-user environments
+- Update signing (Sparkle EdDSA) private key is kept in three places: the
+  `SPARKLE_PRIVATE_KEY` GitHub Secret (release builds), the local login
+  keychain, and `secrets/sparkle-private-key.b64` (git-ignored). If the
+  Secret is ever lost, restore it with:
+  `gh secret set SPARKLE_PRIVATE_KEY < secrets/sparkle-private-key.b64`
 
 ## Debug CLI
 

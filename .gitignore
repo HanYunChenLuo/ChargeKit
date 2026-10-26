@@ -8,6 +8,9 @@ DerivedData/
 
 # macOS
 .DS_Store
+
+# Local signing secrets (never commit)
+secrets/
 *.dSYM
 *.dSYM.zip
 
