@@ -244,7 +244,7 @@ final class HelperService: NSObject, HelperProtocol {
     }
 
     func version(withReply reply: @escaping (String) -> Void) {
-        reply("0.5.5")
+        reply("0.5.6")
     }
 
     func adapterState(withReply reply: @escaping (Bool, Error?) -> Void) {
