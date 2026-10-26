@@ -49,8 +49,24 @@ All reads are unprivileged; writes go through the root daemon with a whitelist o
 ## Requirements
 
 - macOS 13 Ventura or later
-- Apple Silicon MacBook (Intel path uses BCLM, untested)
+- Apple Silicon MacBook
 - Xcode Command Line Tools (Swift 6+)
+
+## Download & Install
+
+1. Download the latest `ChargeKit-vX.Y.Z.dmg` from
+   [Releases](https://github.com/HanYunChenLuo/ChargeKit/releases/latest)
+2. Open the DMG and drag **ChargeKit** into `/Applications`
+3. First launch — macOS Gatekeeper will warn that the app is from an
+   unidentified developer (the app is ad-hoc signed). Allow it once:
+   - **macOS 15+**: open the blocked app once from
+     *System Settings → Privacy & Security → Open Anyway*
+   - **macOS 13/14**: right-click the app → **Open** → **Open**
+4. On first launch, approve the administrator prompt once to install
+   the privileged helper (required for SMC charge control)
+
+After the first launch, updates are delivered automatically through
+Sparkle — no further Gatekeeper prompts are needed.
 
 ## Build & Install
 
@@ -113,6 +129,11 @@ sudo ./scripts/uninstall-helper.sh
 - SMC writes are whitelisted to charge-control keys (`CHTE`, `CHIE`, `BCLM`, etc.)
 - The helper daemon restores charging + adapter on every exit path (SIGTERM, crash, uninstall)
 - The XPC connection currently validates PID only (no code-signing verification) — suitable for single-user machines; audit-token verification is planned for multi-user environments
+- Update signing (Sparkle EdDSA) private key is kept in three places: the
+  `SPARKLE_PRIVATE_KEY` GitHub Secret (release builds), the local login
+  keychain, and `secrets/sparkle-private-key.b64` (git-ignored). If the
+  Secret is ever lost, restore it with:
+  `gh secret set SPARKLE_PRIVATE_KEY < secrets/sparkle-private-key.b64`
 
 ## Debug CLI
 

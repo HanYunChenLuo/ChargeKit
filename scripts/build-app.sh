@@ -30,6 +30,10 @@ cat > "$APP/Contents/Info.plist" <<EOF
     <string>0.4.0</string>
     <key>CFBundleVersion</key>
     <string>5</string>
+    <key>SUFeedURL</key>
+    <string>https://github.com/HanYunChenLuo/ChargeKit/releases/latest/download/appcast.xml</string>
+    <key>SUPublicEDKey</key>
+    <string>MUS+AOtobGIonWlNPzu9eoUVL9VbfekRRARYmJ9o394=</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>NSPrincipalClass</key>
@@ -39,6 +43,14 @@ cat > "$APP/Contents/Info.plist" <<EOF
 EOF
 
 cp "$BIN" "$APP/Contents/MacOS/ChargeKitApp"
+
+# Sparkle auto-update framework: linked via @rpath, so embed it in
+# Frameworks/ and point the executable at that copy.
+SPARKLE_FW="$REPO/.build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
+[ -d "$SPARKLE_FW" ] || { echo "run swift build first (Sparkle dependency missing)"; exit 1; }
+mkdir -p "$APP/Contents/Frameworks"
+cp -R "$SPARKLE_FW" "$APP/Contents/Frameworks/"
+install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP/Contents/MacOS/ChargeKitApp"
 
 # Helper payload: embedded in the app bundle so the app can install or
 # refresh the LaunchDaemon from its own resources.

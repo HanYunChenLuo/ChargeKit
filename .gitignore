@@ -5,10 +5,12 @@ DerivedData/
 
 # Swift Package Manager
 .swiftpm/
-Package.resolved
 
 # macOS
 .DS_Store
+
+# Local signing secrets (never commit)
+secrets/
 *.dSYM
 *.dSYM.zip
 
