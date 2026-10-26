@@ -34,6 +34,7 @@ struct BatteryInfoView: View {
                 InfoRow(label: "电池温度",
                         value: telemetry?.batteryTemp.map { String(format: "%.1f°C", $0) } ?? "—")
                 InfoRow(label: "主机负载", value: watts(telemetry?.hostPower))
+                InfoRow(label: "续航估算", value: runtimeText)
             }
         }
     }
@@ -77,6 +78,13 @@ struct BatteryInfoView: View {
         }
     }
 
+ /// Runtime until empty from the engine's EMA-smoothed estimate; "—"
+ /// while charging, adapter-holding, or still warming up after AC detach.
+    private var runtimeText: String {
+        telemetry?.runtimeEstimateMinutes
+            .map { "≈\(RuntimeText.short(minutes: $0))" } ?? "—"
+    }
+
     private func watts(_ value: Double?) -> String {
         value.map { String(format: "%.1f W", $0) } ?? "—"
     }
@@ -101,5 +109,17 @@ private struct InfoRow: View {
  // Matches SliderRow, the app's label/value rhythm in both the
  // popover and the settings panes.
         .font(.callout)
+    }
+}
+
+/// "3 小时 12 分" / "47 分钟" — shared by the battery-info telemetry row
+/// and the popover status line (each adds its own qualifier).
+enum RuntimeText {
+    static func short(minutes: Double) -> String {
+        let m = Int(minutes.rounded())
+        guard m > 0 else { return "不足 1 分钟" }
+        guard m >= 60 else { return "\(m) 分钟" }
+        let h = m / 60, rem = m % 60
+        return rem == 0 ? "\(h) 小时" : "\(h) 小时 \(rem) 分钟"
     }
 }

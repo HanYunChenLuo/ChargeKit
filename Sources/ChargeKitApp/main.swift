@@ -400,6 +400,19 @@ final class BatteryInfoReader {
               let reason = raw["NotChargingReason"] as? Int else { return nil }
         return reason != 0
     }
+
+ /// Remaining charge in mAh (AppleRawCurrentCapacity) — per-tick
+ /// single-key read; the runtime estimate needs real mAh resolution
+ /// (1% of a ~6 Ah pack is ±60 mAh, vs the gauge's whole-percent steps).
+    static func currentCapacity() -> Double? {
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
+        guard service != 0 else { return nil }
+        defer { IOObjectRelease(service) }
+        guard let raw = IORegistryEntryCreateCFProperty(
+                  service, "AppleRawCurrentCapacity" as CFString, kCFAllocatorDefault, 0)?
+                  .takeRetainedValue() as? Int else { return nil }
+        return Double(raw)
+    }
 }
 
 // MARK: - MagSafe LED
@@ -558,6 +571,10 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
 }
 
 final class ChargeEngine: ObservableObject {
+ /// Poll period the timer runs at (s); also the dt fed to the runtime
+ /// estimator's EMA — keep the two in sync.
+    static let tickInterval: TimeInterval = 2
+
     struct Snapshot {
         var batteryPercent: Double = 0
  /// Raw BMS percent (BUIC), independent of the selected basis: the
@@ -575,6 +592,10 @@ final class ChargeEngine: ObservableObject {
  /// in the battery info telemetry rows.
         var batteryVolts: Double?
         var batteryAmps: Double?
+ /// EMA-smoothed runtime until empty (minutes); nil while charging,
+ /// adapter-holding, warming up after AC detach, or when the capacity /
+ /// voltage reads are unavailable.
+        var runtimeEstimateMinutes: Double?
         var chargingEnabled: Bool = true
         var phase: ChargePhase = .idle
         var readError: String?
@@ -594,6 +615,9 @@ final class ChargeEngine: ObservableObject {
     private let batteryInfoReader = BatteryInfoReader()
  /// Previous tick's AC state — drives the reader's AC-edge full dump.
     private var lastACAttached: Bool?
+ /// EMA filter behind snapshot.runtimeEstimateMinutes (pure Core
+ /// logic, fed once per tick).
+    private var runtimeEstimator = RuntimeEstimator()
     @Published var limitingEnabled: Bool {
         didSet {
             UserDefaults.standard.set(limitingEnabled, forKey: "limitingEnabled")
@@ -929,7 +953,7 @@ final class ChargeEngine: ObservableObject {
  // Push the exit-behavior preference so the daemon knows it before
  // any exit path fires (defaults to restore on the daemon side).
         HelperClient.shared.setExitRestoresCharging(enabled: exitRestoresCharging)
-        let t = Timer(timeInterval: 2, repeats: true) { [weak self] _ in
+        let t = Timer(timeInterval: Self.tickInterval, repeats: true) { [weak self] _ in
             self?.tick()
         }
         RunLoop.main.add(t, forMode: .common)
@@ -1259,6 +1283,7 @@ final class ChargeEngine: ObservableObject {
 
     private func tick() {
         guard let smc else {
+            runtimeEstimator.reset()
             DispatchQueue.main.async {
                 self.snapshot.readError = "SMC unavailable"
             }
@@ -1316,6 +1341,7 @@ final class ChargeEngine: ObservableObject {
  // completed leg.
             sleepGuard.setPreventIdleSleep(false)
             chargeLegStartPercent = nil
+            runtimeEstimator.reset()
             DispatchQueue.main.async { self.snapshot.readError = "\(error)" }
             return
         }
@@ -1337,6 +1363,19 @@ final class ChargeEngine: ObservableObject {
             batteryPower = nil
         }
         let hostPower = batteryPower.map { max(power - $0, 0) }
+
+ // Runtime estimate: EMA over the live battery power. A missing gauge
+ // reading (nil batteryPower) can't feed the filter — reset so a stale
+ // estimate never survives a telemetry gap. Remaining charge is a
+ // separate per-tick read; its absence alone just hides the number.
+        if let bp = batteryPower {
+            runtimeEstimator.addSample(batteryPower: bp, dt: Self.tickInterval)
+        } else {
+            runtimeEstimator.reset()
+        }
+        let runtimeMinutes = runtimeEstimator.estimatedMinutes(
+            remainingMah: BatteryInfoReader.currentCapacity(),
+            voltage: batteryVolts)
 
  // Poll the macOS native limit: it caps everything we can do. The
  // plist changes when the user edits System Settings. Our configured
@@ -1379,6 +1418,7 @@ final class ChargeEngine: ObservableObject {
                     dcInPower: power, batteryTemp: temp,
                     batteryPower: batteryPower, hostPower: hostPower,
                     batteryVolts: batteryVolts, batteryAmps: batteryAmps,
+                    runtimeEstimateMinutes: runtimeMinutes,
                     chargingEnabled: chargingOn, phase: phase, readError: nil)
             }
             return
@@ -1518,6 +1558,7 @@ final class ChargeEngine: ObservableObject {
                     dcInPower: power, batteryTemp: temp,
                     batteryPower: batteryPower, hostPower: hostPower,
                     batteryVolts: batteryVolts, batteryAmps: batteryAmps,
+                    runtimeEstimateMinutes: runtimeMinutes,
                     chargingEnabled: chargingOn, phase: .discharging, readError: nil)
             }
             return
@@ -1600,6 +1641,7 @@ final class ChargeEngine: ObservableObject {
             dcInPower: power, batteryTemp: temp,
             batteryPower: batteryPower, hostPower: hostPower,
             batteryVolts: batteryVolts, batteryAmps: batteryAmps,
+            runtimeEstimateMinutes: runtimeMinutes,
             chargingEnabled: chargingOn, phase: decision.phase, readError: nil,
             chargePaused: acAttached ? batteryChargePaused : false)
 
@@ -1789,10 +1831,13 @@ struct PopoverView: View {
         }
  // macOS 原生限制在电量高于系统上限时会主动放电（drain），无论我们
  // 的 phase 意图是什么。电池真实放电（B0AC < 0）时以电气事实为准。
+ // 续航估算只在真实放电时出现（状态行 + 电池信息遥测行共用同一份）。
+        let runtimeSuffix = snapshot.runtimeEstimateMinutes
+            .map { " · 剩余约 \(RuntimeText.short(minutes: $0))" } ?? ""
         if let bp = snapshot.batteryPower, bp < -0.5, snapshot.phase != .discharging {
             switch snapshot.phase {
             case .holding, .charging:
-                return "电池放电中 · macOS 系统限制生效"
+                return "电池放电中 · macOS 系统限制生效" + runtimeSuffix
             default:
                 break
             }
@@ -1815,7 +1860,8 @@ struct PopoverView: View {
             if engine.dischargeActive {
                 return "放电中 → \(engine.dischargeFloor ?? engine.targetPercent)% · 适配器已断开"
             }
-            return "电池放电中 · 未接电源"
+ // 放电会话的进度语义是"到目标电量"，混入"到空"的续航会误导。
+            return "电池放电中 · 未接电源" + runtimeSuffix
         }
     }
 
