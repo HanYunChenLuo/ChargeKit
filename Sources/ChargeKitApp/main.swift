@@ -1769,7 +1769,6 @@ struct SliderRow: View {
 
 struct PopoverView: View {
     @ObservedObject var engine: ChargeEngine
-    var onOpenSettings: @MainActor () -> Void = {}
  /// Called right after the disclosure toggles so the AppDelegate can
  /// start the window interpolation in the same runloop turn as the
  /// state change (single clock — the chevron's tiny rotation is the
@@ -1845,14 +1844,46 @@ struct PopoverView: View {
                     }
                 }
             }
-            PowerFlowView(
-                dcInPower: engine.snapshot.readError == nil ? engine.snapshot.dcInPower : 0,
-                batteryPower: engine.snapshot.readError == nil ? engine.snapshot.batteryPower : nil,
-                hostPower: engine.snapshot.readError == nil ? engine.snapshot.hostPower : nil)
-                .frame(height: 108)
-
             VStack(alignment: .leading, spacing: 10) {
                 SectionHeader(title: "充电")
+                if engine.calibrationActive {
+                    sessionStatus(title: "校准运行中",
+                                  icon: "arrow.triangle.2.circlepath",
+                                  tint: .purple) {
+                        engine.cancelCalibration()
+                    }
+                } else if engine.dischargeActive {
+                    sessionStatus(title: "放电至 \(engine.dischargeFloor ?? engine.targetPercent)%",
+                                  icon: "arrow.down.circle",
+                                  tint: .blue) {
+                        engine.cancelDischarge()
+                    }
+                } else if engine.topUpActive {
+                    sessionStatus(title: "充满中 → 100%",
+                                  icon: "bolt.fill",
+                                  tint: .green) {
+                        engine.cancelTopUp()
+                    }
+                } else if engine.limitingEnabled {
+                    HStack(spacing: 8) {
+                        Button {
+                            engine.startTopUp()
+                        } label: {
+                            Label("充满一次", systemImage: "bolt.fill")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .disabled(engine.fullChargeLegBlocked)
+                        Button {
+                            engine.startDischarge()
+                        } label: {
+                            Label("放电至 \(engine.targetPercent)%", systemImage: "arrow.down.circle")
+                                .frame(maxWidth: .infinity)
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.regular)
+                    .cardBackground()
+                }
                 Toggle("限制充电", isOn: $engine.limitingEnabled)
                 if engine.limitingEnabled {
                     SliderRow(label: "上限", value: engine.targetPercent, unit: "%",
@@ -1870,42 +1901,13 @@ struct PopoverView: View {
                     Text("达到 \(engine.targetPercent)% 停止充电 · 跌至 \(engine.targetPercent - engine.sailBufferPercent)% 恢复")
                         .font(.caption2).foregroundColor(.secondary)
                 }
-                if engine.calibrationActive {
-                    HStack {
-                        Label("校准运行中", systemImage: "arrow.triangle.2.circlepath")
-                            .foregroundColor(.purple)
-                        Spacer()
-                        Button("取消") { engine.cancelCalibration() }
-                            .buttonStyle(.borderless)
-                    }
-                } else if engine.dischargeActive {
-                    HStack {
-                        Label("放电至 \(engine.dischargeFloor ?? engine.targetPercent)%", systemImage: "arrow.down.circle")
-                            .foregroundColor(.blue)
-                        Spacer()
-                        Button("取消") { engine.cancelDischarge() }
-                            .buttonStyle(.borderless)
-                    }
-                } else if engine.topUpActive {
-                    HStack {
-                        Label("充满中 → 100%", systemImage: "bolt.fill")
-                            .foregroundColor(.green)
-                        Spacer()
-                        Button("取消") { engine.cancelTopUp() }
-                            .buttonStyle(.borderless)
-                    }
-                } else if engine.limitingEnabled {
-                    HStack(spacing: 8) {
-                        Button("充满一次") { engine.startTopUp() }
-                            .disabled(engine.fullChargeLegBlocked)
-                            .frame(maxWidth: .infinity)
-                        Button("放电至 \(engine.targetPercent)%") { engine.startDischarge() }
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.regular)
-                }
             }
+
+            PowerFlowView(
+                dcInPower: engine.snapshot.readError == nil ? engine.snapshot.dcInPower : 0,
+                batteryPower: engine.snapshot.readError == nil ? engine.snapshot.batteryPower : nil,
+                hostPower: engine.snapshot.readError == nil ? engine.snapshot.hostPower : nil)
+                .frame(height: 108)
 
  // Disclosure built by hand (Button + chevron, no DisclosureGroup:
  // its internal animation can't be coordinated with). The panel
@@ -1959,17 +1961,6 @@ struct PopoverView: View {
                     .opacity(engine.batteryInfoExpanded ? 1 : 0)
                     .accessibilityHidden(!engine.batteryInfoExpanded)
             }
-
-            Divider()
-            HStack {
-                Spacer()
-                Button(action: onOpenSettings) {
-                    Label("设置…", systemImage: "gearshape")
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .keyboardShortcut(",", modifiers: .command)
-            }
         }
         .padding(16)
         .frame(width: 320)
@@ -1980,6 +1971,42 @@ struct PopoverView: View {
  // content and footer cannot drift or wobble against each other.
         .onPreferenceChange(BatteryInfoHeightKey.self) { engine.batteryInfoHeight = $0 }
     }
+
+ /// Session banner: colored icon + label in a soft rounded card with
+ /// an inline cancel — reads as "running now" and stays visually
+ /// grouped with the action buttons it replaces.
+    private func sessionStatus(
+        title: String, icon: String, tint: Color,
+        cancel: @escaping () -> Void
+    ) -> some View {
+        HStack(spacing: 8) {
+            Label(title, systemImage: icon)
+                .foregroundColor(tint)
+            Spacer()
+            Button("取消", action: cancel)
+                .buttonStyle(.borderless)
+        }
+        .cardBackground()
+    }
+}
+
+ /// Soft container for the popover's action area: groups buttons and
+ /// session banners above the plain form rows, adapting to light/dark.
+extension View {
+    func cardBackground() -> some View {
+        modifier(CardBackground())
+    }
+}
+
+private struct CardBackground: ViewModifier {
+    func body(content: Content) -> some View {
+        content
+            .padding(10)
+            .frame(maxWidth: .infinity)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(.quaternary))
+    }
 }
 
 /// Popover root: a ScrollView that greedily fills whatever contentSize
@@ -1988,15 +2015,13 @@ struct PopoverView: View {
 /// never runs off the bottom; overflow scrolls).
 struct PopoverRootView: View {
     @ObservedObject var engine: ChargeEngine
-    var onOpenSettings: @MainActor () -> Void = {}
     var onBatteryInfoToggled: (@MainActor () -> Void)? = nil
 
     var body: some View {
  // No scroll indicators: overflow is rare (screen cap) and any brief
  // mid-animation size mismatch would flash one.
         ScrollView(.vertical, showsIndicators: false) {
-            PopoverView(engine: engine, onOpenSettings: onOpenSettings,
-                        onBatteryInfoToggled: onBatteryInfoToggled)
+            PopoverView(engine: engine, onBatteryInfoToggled: onBatteryInfoToggled)
         }
         .frame(width: 320)
     }
@@ -2062,10 +2087,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        let openSettings: @MainActor () -> Void = { [weak self] in
-            guard let self else { return }
-            self.showSettings()
-        }
         popover.behavior = .transient
  // Disclosure toggle → single-clock resize: one 60 Hz timer drives
  // BOTH the window contentSize and the panel height published to
@@ -2102,13 +2123,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popover.contentViewController = NSHostingController(
             rootView: PopoverRootView(
                 engine: engine,
-                onOpenSettings: openSettings,
                 onBatteryInfoToggled: animateDisclosure))
  // Hidden off-window measurer: gives the popover's FINAL content
  // height — its layout runs at the animation target, so the answer
  // is available the moment the disclosure state flips.
-        measurer = NSHostingController(
-            rootView: PopoverView(engine: engine, onOpenSettings: openSettings))
+        measurer = NSHostingController(rootView: PopoverView(engine: engine))
         measurer.view.frame = NSRect(x: 0, y: 0, width: 320, height: 100)
 
  // Any other height-affecting engine change (session banners, text
