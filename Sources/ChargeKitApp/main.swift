@@ -8,6 +8,7 @@ import ServiceManagement
 import UserNotifications
 import SMCKit
 import ChargeKitCore
+import Sparkle
 
 // ChargeKit — macOS menu-bar charge limiter (adapter mode).
 // Reads telemetry unprivileged; privileged writes go through ChargeKitHelper.
@@ -2040,6 +2041,9 @@ private struct BatteryInfoHeightKey: PreferenceKey {
 // MARK: - App bootstrap
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private let updaterController = SPUStandardUpdaterController(
+        startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+
     private var statusItem: NSStatusItem!
     private let engine = ChargeEngine()
     private var popover = NSPopover()
@@ -2213,6 +2217,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             keyEquivalent: "")
         aboutItem.target = self
         appMenu.addItem(aboutItem)
+
+        let updateItem = NSMenuItem(
+            title: "检查更新…",
+            action: #selector(checkForUpdates(_:)),
+            keyEquivalent: "u")
+        updateItem.target = self
+        appMenu.addItem(updateItem)
         appMenu.addItem(NSMenuItem.separator())
 
         let settingsItem = NSMenuItem(
@@ -2271,6 +2282,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc @MainActor
     private func showAbout() {
         NSApp.orderFrontStandardAboutPanel(nil)
+    }
+
+    @objc @MainActor
+    private func checkForUpdates(_ sender: Any?) {
+        updaterController.checkForUpdates(sender)
     }
 
     @objc @MainActor

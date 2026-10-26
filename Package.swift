@@ -6,6 +6,9 @@ let v5: [SwiftSetting] = [.swiftLanguageMode(.v5)]
 let package = Package(
     name: "ChargeKit",
     platforms: [.macOS(.v13)],
+    dependencies: [
+        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.7.0")
+    ],
     targets: [
         .target(
             name: "SMCKit",
@@ -31,7 +34,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "ChargeKitApp",
-            dependencies: ["SMCKit", "ChargeKitCore"],
+            dependencies: ["SMCKit", "ChargeKitCore", .product(name: "Sparkle", package: "Sparkle")],
             path: "Sources/ChargeKitApp",
             swiftSettings: v5
         ),
