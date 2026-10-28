@@ -431,6 +431,13 @@ private struct SettingsPaneView: View {
                 }
                 Toggle("通知", isOn: $engine.notificationsEnabled)
                     .help("达到上限、充满、放电或校准完成，以及系统上限阻止充满时提醒")
+                if engine.notificationsEnabled {
+                    Button("发送测试通知") {
+                        Notifier.shared.post(
+                            title: "ChargeKit 测试通知", body: "权限、图标与横幅样式验证")
+                    }
+                    .help("发送一条示例通知，验证系统通知权限与横幅图标是否正常")
+                }
                 Toggle("自动检查更新", isOn: Binding(
                     get: { updater.automaticallyChecksForUpdates },
                     set: { updater.automaticallyChecksForUpdates = $0 }))

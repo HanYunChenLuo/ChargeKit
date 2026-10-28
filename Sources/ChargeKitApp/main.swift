@@ -555,9 +555,49 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
+        if let icon = Self.iconAttachment() { content.attachments = [icon] }
         let request = UNNotificationRequest(
             identifier: UUID().uuidString, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request)
+    }
+
+ /// macOS 26 renders the banner's leading app-icon slot only for
+ /// Apple-issued signing identities; ad-hoc builds get a blank
+ /// placeholder there (A/B-verified on 26.6.2: icns/Assets.car, path,
+ /// LaunchServices, cache and notification-DB records were all ruled
+ /// out). Attaching the bundle icon as an image keeps notifications
+ /// visually branded. The PNG is rewritten per post — one bounded
+ /// temp file, never stale after an app update.
+    private static func iconAttachment() -> UNNotificationAttachment? {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("com.chargekit.notification-icon.png")
+        do {
+            if let png = iconPNG(side: 128) {
+                try png.write(to: url, options: .atomic)
+            } else if !FileManager.default.fileExists(atPath: url.path) {
+                return nil
+            }
+            return try UNNotificationAttachment(
+                identifier: "app-icon", url: url, options: nil)
+        } catch {
+            return nil
+        }
+    }
+
+    private static func iconPNG(side: Int) -> Data? {
+        guard let iconURL = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
+              let icon = NSImage(contentsOf: iconURL),
+              let rep = NSBitmapImageRep(
+                  bitmapDataPlanes: nil, pixelsWide: side, pixelsHigh: side,
+                  bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                  isPlanar: false, colorSpaceName: .deviceRGB,
+                  bytesPerRow: 0, bitsPerPixel: 0) else { return nil }
+        rep.size = NSSize(width: side, height: side)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        icon.draw(in: NSRect(x: 0, y: 0, width: side, height: side))
+        NSGraphicsContext.restoreGraphicsState()
+        return rep.representation(using: .png, properties: [:])
     }
 
  /// Present banners even while the popover happens to be open.
