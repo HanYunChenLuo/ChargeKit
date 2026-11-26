@@ -204,6 +204,19 @@ do {
     check("delegate: topup at unset limit", del(true, false, 100, 100) == true)
 }
 
+do {
+    func wall(_ v: Double?) -> Bool {
+        SessionRules.wallAttached(dcInVoltage: v)
+    }
+ // Measured with CHIE cut: VD0R still reads the negotiated PD voltage.
+    check("wall-attached: 20.31V yes", wall(20.31) == true)
+    check("wall-attached: 5V floor yes", wall(5.0) == true)
+    check("wall-attached: 4.5V no", wall(4.5) == false)
+    check("wall-attached: unplugged 0V no", wall(0) == false)
+    check("wall-attached: nil no", wall(nil) == false)
+    check("wall-attached: NaN no", wall(.nan) == false)
+}
+
 // MARK: - S6: Native charge-limit stall detection
 
 do {

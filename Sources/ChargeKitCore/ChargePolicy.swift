@@ -169,6 +169,16 @@ public enum SessionRules {
         return temp >= heatThresholdC
     }
 
+ /// True when the adapter is physically attached. While CHIE cuts the
+ /// adapter input, IOPowerSources/ExternalConnected still report
+ /// battery, so those cannot detect a re-plug after a cut. VD0R keeps
+ /// reading the negotiated PD voltage in that state (measured 20.31 V
+ /// with CHIE off); below USB's 5 V floor means no cable.
+    public static func wallAttached(dcInVoltage: Double?) -> Bool {
+        guard let v = dcInVoltage, v.isFinite else { return false }
+        return v > 4.5
+    }
+
  /// Delegate charge limiting to the macOS native charge limit on
  /// firmware without user-writable charging-switch keys. The native
  /// limit holds the battery AT the target with the adapter still
