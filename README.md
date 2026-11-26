@@ -5,7 +5,7 @@ A native macOS charge limiter that gives you full control over your MacBook's ch
 ![macOS 13+](https://img.shields.io/badge/macOS-13%2B-blue)
 ![Swift 6](https://img.shields.io/badge/Swift-6-orange)
 ![License: MIT](https://img.shields.io/badge/License-MIT-green)
-![Tests](https://img.shields.io/badge/Tests-198%20passed-brightgreen)
+![Tests](https://img.shields.io/badge/Tests-222%20passed-brightgreen)
 
 ## What it does
 
@@ -35,9 +35,25 @@ ChargeKit limits how high your MacBook charges, extends battery lifespan, and pr
 
 ChargeKit communicates with the AppleSMC kernel driver via IOKit to read battery telemetry and control charging. A privileged helper daemon (installed via LaunchDaemon) performs the actual SMC writes.
 
+**Control modes** (picked by firmware capability, verified on real hardware):
+
+| Firmware | Charging stopped by | Adapter during a hold |
+|----------|--------------------|-----------------------|
+| macOS ≤ 26.6 (pre-Tahoe & early Tahoe) | `CHTE` / `CH0B`+`CH0C` charge switch | Keeps powering the Mac |
+| macOS 26.7+ (charge-switch keys removed from the SMC table) | Delegates to the macOS native charge limit when it equals your target | Keeps powering the Mac |
+| Same firmware, target below the native limit's 80% floor | `CHIE` adapter switch (the only writable control key) | Cut - the battery carries the Mac (sailing) |
+
+On 26.7+ firmware every `CH*` key except `CHIE` is read-only, and the
+`bfF0`/`bfD0`/`bfE0` firmware-charge-limit keys (the macOS 27-era model
+used by [batt](https://github.com/charlie0129/batt)) accept writes but
+the firmware does not act on them yet. Delegation to the native limit
+is the only way to hold the battery at a target with wall power
+connected there.
+
 **Key SMC registers used:**
 - `CHTE` — charge switch (stop/start charging, adapter keeps powering the Mac)
 - `CHIE` — adapter switch (physically disconnect wall power, for discharge)
+- `VD0R` — DC-in voltage; the only "cable attached" signal that survives an adapter cut (IOPowerSources reports battery while `CHIE` cuts input)
 - `BUIC` — battery percent (BMS-direct)
 - `PDTR` — input power (W)
 - `TB0T` — battery temperature (°C)
@@ -77,7 +93,7 @@ cd ChargeKit
 # Build everything
 swift build -c release
 
-# Run the test suite (198 assertions)
+# Run the test suite (222 assertions)
 swift run policy-tests
 
 # Build and launch the app
@@ -145,11 +161,17 @@ sudo ./scripts/uninstall-helper.sh
 .build/release/smcctl helper-test           # XPC round-trip
 .build/release/smcctl helper-adapter on     # Enable adapter
 .build/release/smcctl helper-discharge on 75 hw  # Start discharge
+.build/release/smcctl enumerate CH          # List SMC keys (sub-8)
+.build/release/smcctl snapshot              # Dump all CH* key values
+sudo .build/release/smcctl probe-writable CHIE bfD0  # Write-permission probe
 ```
 
 ## Known limitations
 
 - The macOS native charge limit (System Settings → Battery) caps what any third-party app can do; if it's below 100%, ChargeKit detects and reports the conflict
+- macOS 26.7+ firmware exposes no user-writable charge-switch key. When your target equals the native limit (recommended: set both to 80%), ChargeKit delegates and the native limit holds the battery at the target with the adapter powering the Mac. With a target below 80% (the native UI floor) it falls back to the adapter switch, so the battery carries the Mac while sailing — the status text says so explicitly
+- After an unplug/replug, powerd rebuilds its charge policy for a few minutes; during that window a replug at the target may sail once (discharge ~5%, then back) before delegation resumes
+- While delegated, the system may occasionally charge to 100% on its own to recalibrate its state-of-charge estimate — that is native Apple behavior
 - BUIC (BMS percent) can "stick" at 100% near full charge while the macOS gauge reads lower — this is normal hardware behavior
 - The MagSafe LED is reset by the system on adapter re-plug; ChargeKit re-asserts within 2 seconds
 
