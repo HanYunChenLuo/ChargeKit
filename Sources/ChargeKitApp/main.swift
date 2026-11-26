@@ -912,6 +912,15 @@ final class ChargeEngine: ObservableObject {
  /// tick would start a second session.
     private var dischargeMirrorEpoch = 0
     private var smc: AppleSMCClient?
+ /// Firmware has a user-writable charging-switch key (CHTE/CH0C): the
+ /// adapter keeps powering the machine while charging is off. On
+ /// keyless firmware (26.7.3) a hold means the adapter is cut and the
+ /// battery carries the machine — the status text must say which. The
+ /// SMC key table is firmware-level, so one probe at init is enough.
+ /// Default-value expression: the engine init reads `self` early, so
+ /// this must not be assigned inside the init body.
+    let chargingSwitchAvailable: Bool = (try? AppleSMCClient())
+        .flatMap { ChargeController(client: $0).chargingKey } != nil
     private var timer: Timer?
  /// Last MagSafe color we asserted (nil = unknown / not yet written).
  /// Read-compare against ACLC each tick: the system resets ACLC on adapter
@@ -1359,6 +1368,7 @@ final class ChargeEngine: ObservableObject {
         let temp: Double?  // nil on read failure; policy treats nil as "no heat check"
         let chargingOn: Bool
         let adapterOn: Bool
+        let dcInVoltage: Double?
         do {
  // Battery-percent basis (parity): the macOS gauge value
  // by default — the number users see in the system UI — with the
@@ -1373,6 +1383,9 @@ final class ChargeEngine: ObservableObject {
                 macos: macosPercent,
                 useHardware: hardwareBatteryPercent)
             power = try controller.dcInPower()
+ // Weak read: a missing DC-in voltage must not kill the tick — the
+ // wall-attached guard below just degrades to the unplug edge.
+            dcInVoltage = try? controller.dcInVoltage()
             temp = try? controller.batteryTemp()
             chargingOn = try controller.isChargingEnabled()
             adapterOn = try controller.isAdapterEnabled()
@@ -1429,10 +1442,15 @@ final class ChargeEngine: ObservableObject {
             if self.targetPercent > sysLimit { self.targetPercent = sysLimit }
         }
 
- // Wall-power presence (used by the session rules and the phase
- // override below). NB: during a daemon discharge session IOPowerSources
- // also reports battery — the session branch below takes precedence.
+ // Wall-power presence: IOPowerSources OR the measured DC-in voltage.
+ // While CHIE cuts the adapter input, IOPowerSources reports battery,
+ // so a re-plug after a cut would be invisible to it forever; VD0R
+ // keeps reading the negotiated PD voltage in that state (measured
+ // 20.31 V with CHIE off) and is the direct physical signal. Without
+ // the OR the delegation gate below deadlocks: delegation needs
+ // acAttached, acAttached needs the adapter on, the adapter stays cut.
         let acAttached = powerSources.acAttached
+            || SessionRules.wallAttached(dcInVoltage: dcInVoltage)
         let batteryChargePaused = BatteryInfoReader.chargePaused() ?? false
 
  // Low Power Mode mirror (public read-only API; the daemon owns
@@ -1777,14 +1795,41 @@ final class ChargeEngine: ObservableObject {
 
         prevPhase = newSnapshot.phase
 
-        if !systemManaged, decision.chargingOn != chargingOn {
-            let wanted = decision.chargingOn
-            HelperClient.shared.setCharging(enabled: wanted) { [weak self] error in
+ // Adapter restore by physical presence. IOPowerSources cannot be
+ // trusted here: while CHIE cuts the input, ExternalConnected reads No,
+ // so after an accidental cut (or a re-plug into it) every signal says
+ // "on battery" forever and nothing would ever restore wall power.
+ // VD0R keeps reporting the negotiated PD voltage in that state
+ // (measured 20.31 V with CHIE off), so it is the cable-attached
+ // signal. Restore only when no path intends the adapter off: a
+ // discharge session, or the policy's own hold (sailing/heat) on
+ // keyless firmware where stopping charge means cutting the adapter.
+        let adapterIntentionallyOff = dischargeActive
+            || (!systemManaged && decision.chargingOn == false)
+        if SessionRules.wallAttached(dcInVoltage: dcInVoltage),
+           !adapterOn, !adapterIntentionallyOff {
+            HelperClient.shared.setAdapter(enabled: true) { [weak self] error in
                 DispatchQueue.main.async {
                     self?.helperError = error.map { "\($0.localizedDescription)" }
                 }
             }
-            newSnapshot.chargingEnabled = wanted
+        }
+
+        if !systemManaged, decision.chargingOn != chargingOn {
+            let wanted = decision.chargingOn
+ // Never write a charging OFF while on battery: it is meaningless
+ // without wall power, and on keyless firmware the fallback write cuts
+ // the adapter, which then masks the re-plug (ExternalConnected stays
+ // No). The on-battery tick skips the write; the first tick after the
+ // cable returns converges back to the policy decision.
+            if wanted || acAttached {
+                HelperClient.shared.setCharging(enabled: wanted) { [weak self] error in
+                    DispatchQueue.main.async {
+                        self?.helperError = error.map { "\($0.localizedDescription)" }
+                    }
+                }
+                newSnapshot.chargingEnabled = wanted
+            }
         }
         DispatchQueue.main.async { self.snapshot = newSnapshot }
 
@@ -1929,7 +1974,12 @@ struct PopoverView: View {
             return "充电已暂停 · macOS 优化充电中"
         case .holding:
  // Current percent lives in the merged header gauge once; the
- // menu-bar title carries it too. Only the semantics stay here.
+ // menu-bar title carries it too. Only the semantics stay here. On
+ // keyless firmware the hold cuts the adapter, so the battery powers
+ // the machine — "适配器供电" would be wrong there.
+            if !engine.chargingSwitchAvailable {
+                return "已停在上限 · 电池供电 · 适配器已断开"
+            }
             return "已停在上限 · 适配器供电"
         case .heatPaused:
             let t = snapshot.batteryTemp.map { String(format: "%.1f", $0) } ?? "—"
