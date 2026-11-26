@@ -27,7 +27,7 @@ cat > "$APP/Contents/Info.plist" <<EOF
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.5.3</string>
+    <string>0.6.0</string>
     <key>CFBundleVersion</key>
     <string>9</string>
     <key>SUFeedURL</key>
