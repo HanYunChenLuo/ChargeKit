@@ -1874,12 +1874,17 @@ final class ChargeEngine: ObservableObject {
         }
 
  // MagSafe LED sync (industry-standard): green at the limit, orange
- // while charging toward it, off when the adapter is cut. Read-compare
- // against ACLC each tick and re-assert only on mismatch — the system
- // resets the key on adapter replug.
+ // while charging toward it, off when the adapter is cut. The charge
+ // must actually be flowing: on keyless firmware chargingEnabled falls
+ // back to the adapter state (always on), and the native limit holds
+ // the battery at the target with NotChargingReason set — an orange
+ // LED there contradicts the menu bar. Read-compare against ACLC each
+ // tick and re-assert only on mismatch — the system resets the key on
+ // adapter replug.
         if magsafeLedEnabled {
             let expected: UInt8 = !adapterOn ? MagSafeColor.off
-                : (newSnapshot.chargingEnabled ? MagSafeColor.orange : MagSafeColor.green)
+                : (newSnapshot.chargingEnabled && !newSnapshot.chargePaused
+                    ? MagSafeColor.orange : MagSafeColor.green)
             if let current = try? smc.read(SMCKey("ACLC")), current.first != expected {
                 lastMagSafeColor = expected
                 HelperClient.shared.setMagSafeColor(expected)
