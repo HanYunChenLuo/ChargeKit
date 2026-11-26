@@ -13,73 +13,9 @@ import Sparkle
 // ChargeKit — macOS menu-bar charge limiter (adapter mode).
 // Reads telemetry unprivileged; privileged writes go through ChargeKitHelper.
 
-/// The macOS native charge limit (System Settings → Battery), read from
-/// powerd's policy plist. Third-party writes are impossible — third-party writes are impossible — but
-/// the plist is world-readable. Returns nil when unreadable or absent.
-func macOSChargeLimit() -> Int? {
-    let url = URL(fileURLWithPath: "/Library/Preferences/com.apple.powerd.charging.plist")
-    guard let data = try? Data(contentsOf: url),
-          let outer = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
-          let policies = outer["policies"] as? Data,
-          let inner = try? PropertyListSerialization.propertyList(from: policies, format: nil) as? [String: Any],
-          let objects = inner["$objects"] as? [Any]
-    else { return nil }
- // NSKeyedArchiver: find the ChargeCtrlPolicy dict carrying soclimit.
-    for case let obj as [String: Any] in objects {
-        if let limit = obj["soclimit"] as? Int { return limit }
-    }
-    return nil
-}
-
-extension NSImage {
- /// Colored copy of a template symbol image (source-in composite).
-    func tinted(_ color: NSColor) -> NSImage {
-        let out = NSImage(size: size)
-        out.lockFocus()
-        let rect = NSRect(origin: .zero, size: size)
-        draw(in: rect)
-        color.set()
-        rect.fill(using: .sourceIn)
-        out.unlockFocus()
-        return out
-    }
-}
-
-extension ChargePhase {
-    var symbolName: String {
-        switch self {
-        case .idle: return "battery.100"
-        case .charging: return "bolt.fill"
-        case .chargePaused: return "pause.circle"
-        case .holding: return "battery.75"
-        case .heatPaused: return "thermometer.high"
-        case .discharging: return "arrow.down.circle.fill"
-        case .systemManaged: return "apple.logo"
-        }
-    }
-
-    var statusColor: NSColor {
-        switch self {
-        case .idle: return .secondaryLabelColor
-        case .charging: return .systemGreen
-        case .chargePaused: return .systemYellow
-        case .holding: return .systemOrange
-        case .heatPaused: return .systemRed
-        case .discharging: return .systemBlue
-        case .systemManaged: return .systemGreen
-        }
-    }
-
- /// Colored (non-template) symbol for the menu bar; nil (idle) means
- /// keep the template image so the system renders it adaptively.
-    var menuBarImage: NSImage? {
-        switch self {
-        case .idle: return nil
-        default:
-            return NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)?
-                .tinted(statusColor)
-        }
-    }
+func openSystemBatterySettings() {
+    guard let url = URL(string: "x-apple.systempreferences:com.apple.Battery-Settings.extension") else { return }
+    NSWorkspace.shared.open(url)
 }
 
 // MARK: - Helper XPC client
@@ -110,8 +46,11 @@ final class HelperClient {
  // rebuilds — the MachService on-demand launch spins up the fresh
  // daemon. Without this the cached dead connection silences every
  // helper write for the rest of the app's life.
-        c.invalidationHandler = { [weak self] in
-            DispatchQueue.main.async { self?.connection = nil }
+        c.invalidationHandler = { [weak self, weak c] in
+            DispatchQueue.main.async {
+                guard let self, let c, self.connection === c else { return }
+                self.connection = nil
+            }
         }
         c.resume()
         connection = c
@@ -125,7 +64,65 @@ final class HelperClient {
     }
 
     func setAdapter(enabled: Bool, completion: @escaping (Error?) -> Void) {
-        proxy?.setAdapter(enabled: enabled, withReply: completion)
+        reportingProxy(completion)?.setAdapter(enabled: enabled, withReply: completion)
+    }
+
+    func restoreAdapter(completion: @escaping (Error?) -> Void) {
+        performTimedWrite(completion: completion) { proxy, reply in
+            proxy.setAdapter(enabled: true, withReply: reply)
+        }
+    }
+
+    func cancelStaleDischarge(hardwarePercent: Bool, completion: @escaping (Error?) -> Void) {
+        performTimedWrite(completion: completion) { proxy, reply in
+            proxy.setDischarge(enabled: false, floorPercent: 0, hardwarePercent: hardwarePercent, withReply: reply)
+        }
+    }
+
+    func releaseMagSafeColor(completion: @escaping (Error?) -> Void) {
+        performTimedWrite(completion: completion) { proxy, reply in
+            proxy.writeKey("ACLC", value: Data([MagSafeColor.system]), withReply: reply)
+        }
+    }
+
+    private func performTimedWrite(
+        completion: @escaping (Error?) -> Void,
+        send: (HelperProtocolObjC, @escaping (Error?) -> Void) -> Void
+    ) {
+        let connection = ensureConnection()
+        let deadline = DispatchTime.now() + .seconds(4)
+        var request = HelperReplyDeadline(deadline: deadline.uptimeNanoseconds)
+        func finish(receivedReply: Bool, error: Error?) {
+            switch request.resolve(at: DispatchTime.now().uptimeNanoseconds, receivedReply: receivedReply) {
+            case .reply:
+                completion(error)
+            case .timedOut:
+                if self.connection === connection {
+                    self.connection = nil
+                    connection.invalidate()
+                }
+                completion(NSError(domain: "com.chargekit.helper", code: Int(ETIMEDOUT),
+                    userInfo: [NSLocalizedDescriptionKey: "Helper 响应超时"]))
+            case nil:
+                break
+            }
+        }
+        let reply: (Error?) -> Void = { error in
+            DispatchQueue.main.async { finish(receivedReply: true, error: error) }
+        }
+        let proxy = connection.remoteObjectProxyWithErrorHandler { reply($0) } as? HelperProtocolObjC
+        guard let proxy else {
+            reply(CocoaError(.xpcConnectionInvalid))
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: deadline) { finish(receivedReply: false, error: nil) }
+        send(proxy, reply)
+    }
+
+    private func reportingProxy(_ completion: @escaping (Error?) -> Void) -> HelperProtocolObjC? {
+        let remote = ensureConnection().remoteObjectProxyWithErrorHandler(completion) as? HelperProtocolObjC
+        if remote == nil { completion(CocoaError(.xpcConnectionInvalid)) }
+        return remote
     }
 
     func setCharging(enabled: Bool, completion: @escaping (Error?) -> Void) {
@@ -146,7 +143,8 @@ final class HelperClient {
     }
 
     func setDischarge(enabled: Bool, floorPercent: Int, hardwarePercent: Bool, completion: @escaping (Error?) -> Void) {
-        proxy?.setDischarge(enabled: enabled, floorPercent: floorPercent, hardwarePercent: hardwarePercent, withReply: completion)
+        reportingProxy(completion)?.setDischarge(
+            enabled: enabled, floorPercent: floorPercent, hardwarePercent: hardwarePercent, withReply: completion)
     }
 
     func dischargeState(completion: @escaping (Bool, Int, Error?) -> Void) {
@@ -164,13 +162,18 @@ final class HelperClient {
 
  /// MagSafe LED color write (ACLC, daemon-whitelisted). Fire-and-forget.
     func setMagSafeColor(_ color: UInt8, completion: @escaping (Error?) -> Void = { _ in }) {
-        proxy?.writeKey("ACLC", value: Data([color]), withReply: completion)
+        reportingProxy(completion)?.writeKey("ACLC", value: Data([color]), withReply: completion)
     }
 
- /// macOS Low Power Mode toggle (daemon-side root pmset; no public
- /// setter API exists). Fire-and-forget.
-    func setLowPowerMode(_ enabled: Bool, completion: @escaping (Error?) -> Void = { _ in }) {
-        proxy?.setLowPowerMode(enabled: enabled, withReply: completion)
+    func setLowPowerMode(_ enabled: Bool, completion: @escaping (Error?) -> Void) {
+        let proxy = ensureConnection().remoteObjectProxyWithErrorHandler {
+            completion($0)
+        } as? HelperProtocolObjC
+        guard let proxy else {
+            completion(CocoaError(.xpcConnectionInvalid))
+            return
+        }
+        proxy.setLowPowerMode(enabled: enabled, withReply: completion)
     }
 
  /// Exit-behavior preference ("Stop Charging when App Closed"
@@ -274,24 +277,35 @@ private let internalBatteryType = "InternalBattery"
 /// counts, mirroring the historical isACAttached fallback for an empty
 /// list — desktops, read failure) and the internal battery's gauge percent
 /// (type-filtered — a UPS would otherwise masquerade as the battery).
-func powerSourceSnapshot() -> (acAttached: Bool, macosPercent: Int?) {
+func powerSourceSnapshot() -> (
+    acAttached: Bool, macosPercent: Int?, internalBatterySource: LowPowerModePolicy.PowerSource?,
+    isCharging: Bool?
+) {
     guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
           let list = IOPSCopyPowerSourcesList(info)?.takeRetainedValue() as? [CFTypeRef],
-          !list.isEmpty else { return (true, nil) }
+          !list.isEmpty else { return (true, nil, nil, nil) }
     var ac = false
     var percent: Int?
+    var internalBatterySource: LowPowerModePolicy.PowerSource?
+    var isCharging: Bool?
     for source in list {
         guard let desc = IOPSGetPowerSourceDescription(info, source)?
             .takeUnretainedValue() as? [String: Any] else { continue }
-        if (desc[kIOPSPowerSourceStateKey as String] as? String) == kIOPSACPowerValue {
+        let state = desc[kIOPSPowerSourceStateKey as String] as? String
+        if state == kIOPSACPowerValue {
             ac = true
         }
-        if (desc[kIOPSTypeKey as String] as? String) == internalBatteryType,
-           let capacity = desc[kIOPSCurrentCapacityKey as String] as? Int {
-            percent = capacity
+        if (desc[kIOPSTypeKey as String] as? String) == internalBatteryType {
+            percent = desc[kIOPSCurrentCapacityKey as String] as? Int
+            isCharging = desc[kIOPSIsChargingKey as String] as? Bool
+            if state == kIOPSACPowerValue {
+                internalBatterySource = .external
+            } else if state == kIOPSBatteryPowerValue {
+                internalBatterySource = .battery
+            }
         }
     }
-    return (ac, percent)
+    return (ac, percent, internalBatterySource, isCharging)
 }
 
 // MARK: - Battery info (public IORegistry / IOPowerSources)
@@ -617,7 +631,7 @@ final class ChargeEngine: ObservableObject {
  /// estimator's EMA — keep the two in sync.
     static let tickInterval: TimeInterval = 2
 
-    struct Snapshot {
+    struct Snapshot: Equatable {
         var batteryPercent: Double = 0
  /// Raw BMS percent (BUIC), independent of the selected basis: the
  /// stall detector watches the physical value and the battery-info
@@ -645,9 +659,38 @@ final class ChargeEngine: ObservableObject {
  /// (ChargerData.NotChargingReason != 0) even though the SMC charging
  /// switch is on.
         var chargePaused: Bool = false
+        var adapterRecoveryNeeded = false
+        var systemPowerSource: LowPowerModePolicy.PowerSource?
+        var systemIsCharging: Bool?
+        var systemBatteryPercent: Int?
+
+        var hasTelemetry: Bool { readError == nil && hardwareBatteryPercent != nil }
+        var hasBatteryPercent: Bool { hasTelemetry || systemBatteryPercent != nil }
+
+        var isDrainingWhileChargeManaged: Bool {
+            guard let batteryPower, batteryPower < -0.5 else { return false }
+            return phase == .holding || phase == .charging || phase == .systemManaged
+        }
     }
 
     @Published var snapshot = Snapshot()
+    let chargeControlMode: SessionRules.ChargeControlMode
+    private var adapterRestoreAfter: TimeInterval = 0
+    private var adapterRestoreInFlight = false
+    private var adapterProbeAttempts = 0
+    private var adapterProbeEpoch = 0
+    private var awaitingAdapterPower = false
+    private var adapterProbeRetryAfter: TimeInterval = 0
+    private var pendingDischargeCancellation = false
+    private var dischargeCancellationInFlight = false
+
+    private func publishSnapshot(_ updated: Snapshot) {
+        if snapshot != updated { snapshot = updated }
+    }
+
+    private func publishReadError(_ message: String) {
+        if snapshot.readError != message { snapshot.readError = message }
+    }
  /// Battery health + adapter details (public IORegistry/IOPS sources),
  /// refreshed every tick; independent of the SMC reads, so the info
  /// views keep their data across snapshot read errors.
@@ -729,24 +772,6 @@ final class ChargeEngine: ObservableObject {
             if notificationsEnabled { Notifier.shared.requestAuthorization() }
         }
     }
- /// Popover「电池信息」折叠区状态。住在 engine 而非视图 @State：隐藏
- /// measurer 持有另一个 PopoverView 实例，@State 会让两者高度永久分裂
- /// （展开后 measurer 仍量收起态，2s tick 把高度压回）；共享 + 发布即
- /// 触发重测，展开/收起一个 runloop 内生效。持久化记住用户偏好。
-    @Published var batteryInfoExpanded: Bool {
-        didSet { UserDefaults.standard.set(batteryInfoExpanded, forKey: "batteryInfoExpanded") }
-    }
- /// Natural height of the battery-info panel, measured by the view itself
- /// (it lays out at natural height even while collapsed) so the collapse
- /// frame can animate a numeric 0 ↔ natural height. View-derived, not
- /// persisted.
-    @Published var batteryInfoHeight: CGFloat = 0
- /// Live panel height while the AppDelegate resize timer drives the
- /// disclosure — SINGLE-CLOCK animation: the SwiftUI animation modifier
- /// is gone; the timer publishes this per tick and the window follows
- /// the same tick, so border, content and footer cannot phase-wobble.
- /// nil at rest; the view derives the static height then.
-    @Published var displayPanelHeight: CGFloat? = nil
  /// Battery-percent basis for every feature ("Hardware Battery
  /// Percentage" parity): off = the macOS gauge value users see in the
  /// system UI, on = the BMS-direct value. See
@@ -799,24 +824,84 @@ final class ChargeEngine: ObservableObject {
  /// the source of truth (no UserDefaults mirror); `launchAtLogin` is
  /// re-read from SMAppService on every launch.
     @Published var launchAtLogin: Bool
- /// macOS Low Power Mode mirror. `ProcessInfo.isLowPowerModeEnabled`
- /// (public read-only API) is re-read every tick, so changes from
- /// System Settings, the battery menu and scheduled LPM actions all
- /// show within 2 s; writes go through the daemon's pmset path.
-    @Published var lowPowerModeEnabled = false
- /// Local toggle writes suppress the tick mirror briefly — otherwise a
- /// tick landing between the optimistic set and pmset taking effect
- /// would bounce the switch back.
-    private var lastLocalLPMWriteAt: Date?
+    @Published private(set) var lowPowerModeEnabled = ProcessInfo.processInfo.isLowPowerModeEnabled
+    @Published private var pendingManualLowPowerMode: Bool?
+    @Published private(set) var lowPowerModeError: String?
+    @Published var automaticLowPowerMode: Bool {
+        didSet { UserDefaults.standard.set(automaticLowPowerMode, forKey: "automaticLowPowerMode") }
+    }
+    @Published var lowPowerModeThreshold: Int {
+        didSet { UserDefaults.standard.set(lowPowerModeThreshold, forKey: "lowPowerModeThreshold") }
+    }
+    private var lowPowerModeWriteInFlight = false
+    private var queuedLowPowerMode: Bool?
+    private var lastLowPowerModeWrite = -Double.infinity
+    private static let manualLowPowerModeKey = "manualLowPowerModeSession"
+    private var manualLowPowerMode: LowPowerModePolicy.ManualSession {
+        didSet {
+            if oldValue.state != manualLowPowerMode.state {
+                UserDefaults.standard.set(manualLowPowerMode.state?.rawValue, forKey: Self.manualLowPowerModeKey)
+            }
+        }
+    }
+    private var managedLowPowerModeTarget: Bool?
+
+    var lowPowerModeSwitchValue: Bool { pendingManualLowPowerMode ?? lowPowerModeEnabled }
 
     func setLowPowerMode(_ on: Bool) {
- // Optimistic; the tick mirror corrects within 2 s when the XPC
- // call fails or pmset rejects the change.
-        lowPowerModeEnabled = on
-        lastLocalLPMWriteAt = Date()
+        let sources = powerSourceSnapshot()
+        manualLowPowerMode.observe(lowPowerModeSource(
+            internalSource: sources.internalBatterySource, dcInVoltage: readDCInVoltage()))
+        manualLowPowerMode.set(on)
+        pendingManualLowPowerMode = on
+        requestLowPowerMode(on)
+    }
+
+    private func requestLowPowerMode(_ on: Bool) {
+        if lowPowerModeWriteInFlight {
+            queuedLowPowerMode = on
+        } else {
+            queuedLowPowerMode = nil
+            writeLowPowerMode(on)
+        }
+    }
+
+    private func updateLowPowerMode(source: LowPowerModePolicy.PowerSource?, batteryPercent: Int?) {
+        let current = ProcessInfo.processInfo.isLowPowerModeEnabled
+        if lowPowerModeEnabled != current { lowPowerModeEnabled = current }
+        manualLowPowerMode.observe(source)
+        let target = manualLowPowerMode.target ?? LowPowerModePolicy.target(
+            enabled: automaticLowPowerMode, source: source,
+            batteryPercent: batteryPercent, threshold: lowPowerModeThreshold)
+        if let pending = pendingManualLowPowerMode,
+           (target != nil && target != pending) || (!lowPowerModeWriteInFlight && current == pending) {
+            pendingManualLowPowerMode = nil
+        }
+        managedLowPowerModeTarget = target
+        if let target, queuedLowPowerMode != target { queuedLowPowerMode = nil }
+        guard !sleepPauseLatch, !lowPowerModeWriteInFlight else { return }
+        if let queued = queuedLowPowerMode {
+            queuedLowPowerMode = nil
+            writeLowPowerMode(queued)
+        } else if let target, current != target || manualLowPowerMode.needsRestore,
+                  ProcessInfo.processInfo.systemUptime - lastLowPowerModeWrite >= 3 {
+            writeLowPowerMode(target)
+        }
+    }
+
+    private func writeLowPowerMode(_ on: Bool) {
+        lowPowerModeWriteInFlight = true
         HelperClient.shared.setLowPowerMode(on) { [weak self] error in
             DispatchQueue.main.async {
-                if let error { self?.helperError = "省电模式：\(error.localizedDescription)" }
+                guard let self else { return }
+                self.lastLowPowerModeWrite = ProcessInfo.processInfo.systemUptime
+                self.lowPowerModeWriteInFlight = false
+                if error == nil { self.manualLowPowerMode.didWrite(on) }
+                if error != nil && self.pendingManualLowPowerMode == on {
+                    self.pendingManualLowPowerMode = nil
+                }
+                let message = error?.localizedDescription
+                if self.lowPowerModeError != message { self.lowPowerModeError = message }
             }
         }
     }
@@ -846,19 +931,10 @@ final class ChargeEngine: ObservableObject {
     @Published var magsafeLedEnabled: Bool {
         didSet {
             UserDefaults.standard.set(magsafeLedEnabled, forKey: "magsafeLedEnabled")
-            if !magsafeLedEnabled, lastMagSafeColor != nil {
- // Hand control back to macOS once; the daemon also restores
- // 0x00 on exit, so a crash never pins a stale color.
-                lastMagSafeColor = nil
-                HelperClient.shared.setMagSafeColor(MagSafeColor.system)
-            }
+            releaseMagSafeColorIfNeeded()
         }
     }
     @Published var helperError: String?
- /// macOS native charge limit (System Settings → Battery), polled each
- /// tick. Our configured limit can never exceed it; the UI slider is
- /// clamped to this ceiling. nil = unreadable (treated as 100).
-    @Published var systemChargeLimit: Int = 100
 
     private var calibration = CalibrationSession()
     private let calibrationConfig = CalibrationConfig()
@@ -926,8 +1002,10 @@ final class ChargeEngine: ObservableObject {
  /// Read-compare against ACLC each tick: the system resets ACLC on adapter
  /// replug, so we re-assert only when the key actually differs.
     private var lastMagSafeColor: UInt8?
+    private var magSafeReleaseInFlight = false
     private var sleepObserver: NSObjectProtocol?
     private var wakeObserver: NSObjectProtocol?
+    private var powerSourceObserver: CFRunLoopSource?
  /// Main-queue latch set at will-sleep: while set, the tick never writes
  /// charging/adapter state. Keeps the sleep-stop cut in place even when
  /// the machine half-wakes for maintenance (DarkWake) with the lid still
@@ -946,8 +1024,15 @@ final class ChargeEngine: ObservableObject {
         self.preventSleepUntilLimit = d.object(forKey: "preventSleepUntilLimit") as? Bool ?? false
         self.autoDischargeEnabled = d.object(forKey: "autoDischargeEnabled") as? Bool ?? false
         self.notificationsEnabled = d.object(forKey: "notificationsEnabled") as? Bool ?? false
-        self.batteryInfoExpanded = d.object(forKey: "batteryInfoExpanded") as? Bool ?? false
         self.hardwareBatteryPercent = d.object(forKey: "hardwareBatteryPercent") as? Bool ?? false
+        self.automaticLowPowerMode = d.bool(forKey: "automaticLowPowerMode")
+        self.manualLowPowerMode = LowPowerModePolicy.ManualSession(
+            state: d.string(forKey: Self.manualLowPowerModeKey)
+                .flatMap(LowPowerModePolicy.ManualSession.State.init(rawValue:)))
+        let threshold = d.object(forKey: "lowPowerModeThreshold") as? Int
+        self.lowPowerModeThreshold = threshold.flatMap {
+            LowPowerModePolicy.thresholdRange.contains($0) ? $0 : nil
+        } ?? LowPowerModePolicy.defaultThreshold
         self.exitRestoresCharging = d.object(forKey: "exitRestoresCharging") as? Bool ?? true
         self.actionHistory = (d.data(forKey: "actionHistory")
             .flatMap { try? JSONDecoder().decode([ActionHistoryEntry].self, from: $0) }) ?? []
@@ -976,6 +1061,21 @@ final class ChargeEngine: ObservableObject {
         schedule = ScheduleEngine(lastFiredDay: lastFired)
         self.calibrationActive = d.object(forKey: "calibrationActive") as? Bool ?? false
         self.magsafeLedEnabled = d.object(forKey: "magsafeLedEnabled") as? Bool ?? false
+        let smc = try? AppleSMCClient()
+        self.smc = smc
+        let nativeLimitSupported: Bool
+        #if arch(arm64)
+        if #available(macOS 26.4, *) {
+            nativeLimitSupported = true
+        } else {
+            nativeLimitSupported = false
+        }
+        #else
+        nativeLimitSupported = false
+        #endif
+        chargeControlMode = .init(
+            nativeLimitSupported: nativeLimitSupported,
+            independentSwitchAvailable: smc.flatMap { ChargeController(client: $0).chargingKey } != nil)
         if calibrationActive {
             let phase = d.string(forKey: "calibrationPhase")
                 .flatMap(CalibrationSession.Phase.init(rawValue:))
@@ -984,7 +1084,6 @@ final class ChargeEngine: ObservableObject {
                 fullSince: d.object(forKey: "calibrationFullSince") as? Date,
                 legConfirmedActive: d.bool(forKey: "calibrationLegConfirmed"))
         }
-        self.smc = try? AppleSMCClient()
         persistScheduleBookkeeping()
         self.workdayCalendarStatus = workdayStatusMessage()
     }
@@ -1003,7 +1102,14 @@ final class ChargeEngine: ObservableObject {
         }
  // Push the exit-behavior preference so the daemon knows it before
  // any exit path fires (defaults to restore on the daemon side).
-        HelperClient.shared.setExitRestoresCharging(enabled: exitRestoresCharging)
+        HelperClient.shared.setExitRestoresCharging(
+            enabled: !chargeControlMode.controlsCharging || exitRestoresCharging)
+        if !chargeControlMode.controlsCharging {
+            if topUpActive { cancelTopUp() }
+            if calibrationActive { cancelCalibration() }
+            // An older build may have left a daemon-owned discharge running.
+            pendingDischargeCancellation = true
+        }
         let t = Timer(timeInterval: Self.tickInterval, repeats: true) { [weak self] _ in
             self?.tick()
         }
@@ -1017,7 +1123,8 @@ final class ChargeEngine: ObservableObject {
         sleepObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.willSleepNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            guard let self, self.sleepStopCharging else { return }
+            guard let self, self.chargeControlMode.controlsCharging, self.sleepStopCharging,
+                  let smc = self.smc, ChargeController(client: smc).chargingKey != nil else { return }
             self.sleepPauseLatch = true
             NSLog("[ChargeKit] will-sleep: cutting charging (sleep-stop)")
             HelperClient.shared.setChargingSync(enabled: false)
@@ -1032,6 +1139,16 @@ final class ChargeEngine: ObservableObject {
                 self.recordHistory(.sessionStarted, "唤醒 · 恢复充电")
             }
             self.sleepPauseLatch = false
+            self.resetAdapterProbe()
+            self.refreshLowPowerMode()
+        }
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        powerSourceObserver = IOPSNotificationCreateRunLoopSource({ context in
+            guard let context else { return }
+            Unmanaged<ChargeEngine>.fromOpaque(context).takeUnretainedValue().refreshLowPowerMode()
+        }, context)?.takeRetainedValue()
+        if let powerSourceObserver {
+            CFRunLoopAddSource(CFRunLoopGetMain(), powerSourceObserver, .commonModes)
         }
         refreshWorkdayCalendarData()
         tick()
@@ -1040,6 +1157,8 @@ final class ChargeEngine: ObservableObject {
     func stop() {
         timer?.invalidate()
         timer = nil
+        if let powerSourceObserver { CFRunLoopSourceInvalidate(powerSourceObserver) }
+        powerSourceObserver = nil
         for o in [sleepObserver, wakeObserver].compactMap({ $0 }) {
             NSWorkspace.shared.notificationCenter.removeObserver(o)
         }
@@ -1047,10 +1166,12 @@ final class ChargeEngine: ObservableObject {
         wakeObserver = nil
     }
 
+    deinit { stop() }
+
  // MARK: session control (UI actions)
 
     func startTopUp() {
-        guard limitingEnabled, !nativeLimitStallActive else { return }
+        guard chargeControlMode.controlsCharging, limitingEnabled, !nativeLimitStallActive else { return }
         if dischargeActive { cancelDischarge() }
         topUpActive = true
         recordHistory(.sessionStarted, "充满一次")
@@ -1065,7 +1186,7 @@ final class ChargeEngine: ObservableObject {
     }
 
     func startDischarge() {
-        guard limitingEnabled else { return }
+        guard chargeControlMode.controlsCharging, limitingEnabled else { return }
         if topUpActive { topUpActive = false }
         let floor = targetPercent
         recordHistory(.sessionStarted, "放电至 \(floor)%")
@@ -1101,7 +1222,7 @@ final class ChargeEngine: ObservableObject {
  // MARK: calibration control (UI actions)
 
     func startCalibration() {
-        guard limitingEnabled, !calibrationActive, !nativeLimitStallActive else { return }
+        guard chargeControlMode.controlsCharging, limitingEnabled, !calibrationActive, !nativeLimitStallActive else { return }
         topUpActive = false
         if dischargeActive { cancelDischarge() }
         calibration = CalibrationSession()
@@ -1146,7 +1267,8 @@ final class ChargeEngine: ObservableObject {
         return ScheduleRule(
             hour: c.component(.hour, from: now),
             minute: c.component(.minute, from: now),
-            repeatMode: .daily, action: .setLimit(80))
+            repeatMode: .daily,
+            action: chargeControlMode.controlsCharging ? .setLimit(80) : .setLowPowerMode(true))
     }
 
     func saveScheduleRule(
@@ -1293,14 +1415,23 @@ final class ChargeEngine: ObservableObject {
     }
 
     private func applyScheduled(_ action: ScheduleAction, batteryPercent pct: Double) {
+        guard supportsScheduleAction(action) else { return }
+        if case .setLowPowerMode(let on) = action,
+           let target = managedLowPowerModeTarget {
+            if on != target {
+                let reason = manualLowPowerMode.target == nil ? "自动规则优先" : "手动设置优先"
+                recordHistory(.scheduledAction, "\(action.historyDetail) · \(reason)")
+            }
+            return
+        }
  // Record the scheduled action before executing it.
         recordHistory(.scheduledAction, action.historyDetail)
         switch action {
         case .setLimit(let v):
-            targetPercent = min(max(v, 50), max(systemChargeLimit, 50))
+            targetPercent = min(max(v, 50), 100)
         case .dischargeTo(let v):
             limitingEnabled = true
-            targetPercent = min(max(v, 50), max(systemChargeLimit, 50))
+            targetPercent = min(max(v, 50), 100)
             startDischarge()
         case .pauseCharging:
  // Limit = current battery: charging and discharging stop
@@ -1315,10 +1446,120 @@ final class ChargeEngine: ObservableObject {
             limitingEnabled = true
             startCalibration()
         case .setLowPowerMode(let on):
-            HelperClient.shared.setLowPowerMode(on) { [weak self] error in
-                DispatchQueue.main.async {
-                    self?.helperError = error.map { "\($0.localizedDescription)" }
-                }
+            requestLowPowerMode(on)
+        }
+    }
+
+    func supportsScheduleAction(_ action: ScheduleAction) -> Bool {
+        if case .setLowPowerMode = action { return true }
+        return chargeControlMode.controlsCharging
+    }
+
+    private func evaluateSchedule(batteryPercent: Double) {
+        refreshWorkdayCalendarIfNeeded()
+        let now = Date()
+        let year = WorkdayCalendar.gregorianYear(for: now, calendar: .current)
+        let waitingForCalendar = workdayCalendarRegion == .mainlandChina
+            && workdayCalendarClient.isLoading(year: year)
+            && !workdayCalendarClient.hasCalendar(year: year)
+        let eligible = scheduleRules.filter { rule in
+            guard supportsScheduleAction(rule.action) else { return false }
+            if waitingForCalendar, case .weekdays = rule.repeatMode { return false }
+            return true
+        }
+        let due = schedule.dueRules(
+            eligible, now: now, calendar: .current, workdayCalendar: scheduleWorkdayCalendar)
+        guard !due.isEmpty else { return }
+        for fired in due {
+            applyScheduled(fired.action, batteryPercent: batteryPercent)
+            if !fired.enabled, let i = scheduleRules.firstIndex(where: { $0.id == fired.id }) {
+                scheduleRules[i].enabled = false
+            }
+        }
+        persistScheduleBookkeeping()
+    }
+
+    private func estimateRuntime(batteryPower: Double?, batteryVolts: Double?) -> Double? {
+        if let batteryPower {
+            runtimeEstimator.addSample(batteryPower: batteryPower, dt: Self.tickInterval)
+        } else {
+            runtimeEstimator.reset()
+        }
+        guard runtimeEstimator.isReady, let batteryVolts, batteryVolts > 0 else { return nil }
+        return runtimeEstimator.estimatedMinutes(
+            remainingMah: BatteryInfoReader.currentCapacity(), voltage: batteryVolts)
+    }
+
+    private func recordAdapterConnection(_ attached: Bool) {
+        if let prevACAttached, attached != prevACAttached {
+            recordHistory(attached ? .sessionStarted : .sessionCancelled,
+                          attached ? "适配器已接入" : "适配器已拔出")
+        }
+        prevACAttached = attached
+    }
+
+    private func syncMagSafeColor(_ color: UInt8, using smc: AppleSMCClient) {
+        guard magsafeLedEnabled, !magSafeReleaseInFlight, let current = try? smc.read(SMCKey("ACLC")),
+              let currentColor = current.first else { return }
+        lastMagSafeColor = color
+        if currentColor != color {
+            HelperClient.shared.setMagSafeColor(color)
+        }
+    }
+
+    private func releaseMagSafeColorIfNeeded() {
+        guard !magsafeLedEnabled, lastMagSafeColor != nil, !magSafeReleaseInFlight else { return }
+        magSafeReleaseInFlight = true
+        HelperClient.shared.releaseMagSafeColor { [weak self] error in
+            guard let self else { return }
+            self.magSafeReleaseInFlight = false
+            if error == nil, !self.magsafeLedEnabled { self.lastMagSafeColor = nil }
+        }
+    }
+
+    private func cancelStaleDischargeIfNeeded() {
+        guard pendingDischargeCancellation, !dischargeCancellationInFlight else { return }
+        dischargeCancellationInFlight = true
+        HelperClient.shared.cancelStaleDischarge(hardwarePercent: hardwareBatteryPercent) { [weak self] error in
+            guard let self else { return }
+            self.dischargeCancellationInFlight = false
+            if error == nil { self.pendingDischargeCancellation = false }
+        }
+    }
+
+    private func resetAdapterProbe() {
+        adapterProbeAttempts = 0
+        adapterProbeRetryAfter = 0
+        adapterProbeEpoch += 1
+    }
+
+    private func recoverAdapterIfNeeded(_ recovery: SessionRules.ChargeControlMode.AdapterRecovery) {
+        let maxProbeAttempts = 3
+        if recovery != .probe, adapterProbeAttempts > 0 || adapterProbeRetryAfter > 0 {
+            resetAdapterProbe()
+        }
+        if recovery == .none { awaitingAdapterPower = false }
+        guard recovery != .none, !adapterRestoreInFlight else { return }
+
+        let uptime = ProcessInfo.processInfo.systemUptime
+        if recovery == .probe, uptime < adapterProbeRetryAfter { return }
+        guard uptime >= adapterRestoreAfter else { return }
+        adapterRestoreAfter = uptime + 5
+        adapterRestoreInFlight = true
+        awaitingAdapterPower = true
+        let epoch = adapterProbeEpoch
+        if recovery == .probe {
+            adapterProbeAttempts += 1
+            if adapterProbeAttempts >= maxProbeAttempts {
+                adapterProbeAttempts = 0
+                adapterProbeRetryAfter = uptime + 60
+            }
+        }
+        HelperClient.shared.restoreAdapter { [weak self] error in
+            guard let self else { return }
+            self.adapterRestoreInFlight = false
+            if recovery == .restore || self.adapterProbeEpoch == epoch {
+                self.helperError = error.map { "恢复适配器供电失败 · \($0.localizedDescription)" }
             }
         }
     }
@@ -1332,16 +1573,26 @@ final class ChargeEngine: ObservableObject {
             heatThresholdC: Double(heatThresholdC))
     }
 
-    private func tick() {
-        guard let smc else {
-            runtimeEstimator.reset()
-            DispatchQueue.main.async {
-                self.snapshot.readError = "SMC unavailable"
-            }
-            return
-        }
-        let controller = ChargeController(client: smc)
+    private func readDCInVoltage() -> Double? {
+        smc.flatMap { try? ChargeController(client: $0).dcInVoltage() }
+    }
 
+    private func lowPowerModeSource(
+        internalSource: LowPowerModePolicy.PowerSource?, dcInVoltage: Double?
+    ) -> LowPowerModePolicy.PowerSource? {
+        if SessionRules.wallAttached(dcInVoltage: dcInVoltage) { return .external }
+        return internalSource
+    }
+
+    private func refreshLowPowerMode() {
+        let sources = powerSourceSnapshot()
+        updateLowPowerMode(
+            source: lowPowerModeSource(internalSource: sources.internalBatterySource, dcInVoltage: readDCInVoltage()),
+            batteryPercent: sources.macosPercent)
+    }
+
+    private func tick() {
+        releaseMagSafeColorIfNeeded()
  // One IOPowerSources snapshot per tick (two separate
  // copies was pure main-thread waste): AC state, the macOS gauge
  // percent for the battery-info view and the basis selection, and
@@ -1351,24 +1602,79 @@ final class ChargeEngine: ObservableObject {
         let acChanged = (lastACAttached ?? powerSources.acAttached) != powerSources.acAttached
         lastACAttached = powerSources.acAttached
 
- // Battery health + adapter details, read before the SMC block so
- // every tick exit path (including SMC failures) keeps the info
- // views fed. Gated publish: unchanged values cost nothing (P1-3 —
- // every publish runs a hidden-measurer layout while the popover
- // is shown).
+ // Keep health and macOS gauge data available even when SMC is unavailable.
         let batteryInfo = batteryInfoReader.read(macosPercent: macosPercent, acChanged: acChanged)
         DispatchQueue.main.async {
             guard self.batteryInfo != batteryInfo else { return }
             self.batteryInfo = batteryInfo
         }
 
+        let controller = smc.map { ChargeController(client: $0) }
+        // Voltage distinguishes a physically attached adapter even if a
+        // discharge session has cut its input and macOS reports battery power.
+        let dcInVoltage = controller.flatMap { try? $0.dcInVoltage() }
+        updateLowPowerMode(
+            source: lowPowerModeSource(internalSource: powerSources.internalBatterySource, dcInVoltage: dcInVoltage),
+            batteryPercent: macosPercent)
+
+        if !chargeControlMode.controlsCharging {
+            cancelStaleDischargeIfNeeded()
+            let adapterEnabled = controller.flatMap { try? $0.isAdapterEnabled() }
+            let physicalConnection = SessionRules.wallAttached(dcInVoltage: dcInVoltage)
+            let external = powerSources.internalBatterySource == .external
+            let rawPercent = controller.flatMap { try? $0.batteryPercent() }
+            let recovery = chargeControlMode.adapterRecovery(
+                adapterEnabled: adapterEnabled, dcInVoltage: dcInVoltage,
+                externalPower: external,
+                hasBattery: macosPercent != nil || powerSources.internalBatterySource != nil || rawPercent != nil,
+                awaitingPowerConfirmation: awaitingAdapterPower)
+            if powerSources.internalBatterySource != nil || physicalConnection {
+                recordAdapterConnection(external || physicalConnection)
+            }
+            recoverAdapterIfNeeded(recovery)
+            let pct = macosPercent.map(Double.init) ?? rawPercent ?? 0
+            evaluateSchedule(batteryPercent: pct)
+            let volts = controller.flatMap { try? $0.batteryVoltage() }
+            let amps = controller.flatMap { try? $0.batteryCurrent() }
+            let power = controller.flatMap { try? $0.dcInPower() } ?? 0
+            let batteryPower = volts.flatMap { v in amps.map { v * $0 } }
+            let phase: ChargePhase
+            if powerSources.internalBatterySource == .battery {
+                phase = .discharging
+            } else if chargeControlMode == .systemManaged {
+                phase = .systemManaged
+            } else {
+                phase = .idle
+            }
+            publishSnapshot(Snapshot(
+                batteryPercent: pct, hardwareBatteryPercent: rawPercent, dcInPower: power,
+                batteryTemp: controller.flatMap { try? $0.batteryTemp() }, batteryPower: batteryPower,
+                hostPower: batteryPower.map { max(power - $0, 0) }, batteryVolts: volts, batteryAmps: amps,
+                runtimeEstimateMinutes: estimateRuntime(batteryPower: batteryPower, batteryVolts: volts),
+                chargingEnabled: powerSources.isCharging == true, phase: phase,
+                chargePaused: external && powerSources.isCharging == false,
+                adapterRecoveryNeeded: recovery != .none && (physicalConnection || external),
+                systemPowerSource: powerSources.internalBatterySource, systemIsCharging: powerSources.isCharging,
+                systemBatteryPercent: macosPercent))
+            if external, adapterEnabled != false, let isCharging = powerSources.isCharging, let smc {
+                syncMagSafeColor(isCharging ? MagSafeColor.orange : MagSafeColor.green, using: smc)
+            }
+            return
+        }
+
+        guard let smc, let controller else {
+            runtimeEstimator.reset()
+            DispatchQueue.main.async {
+                self.publishReadError("SMC unavailable")
+            }
+            return
+        }
         let pct: Double
         let hardwarePct: Double   // raw BUIC: stall detector + dual-percent row
         let power: Double
         let temp: Double?  // nil on read failure; policy treats nil as "no heat check"
         let chargingOn: Bool
         let adapterOn: Bool
-        let dcInVoltage: Double?
         do {
  // Battery-percent basis (parity): the macOS gauge value
  // by default — the number users see in the system UI — with the
@@ -1383,9 +1689,6 @@ final class ChargeEngine: ObservableObject {
                 macos: macosPercent,
                 useHardware: hardwareBatteryPercent)
             power = try controller.dcInPower()
- // Weak read: a missing DC-in voltage must not kill the tick — the
- // wall-attached guard below just degrades to the unplug edge.
-            dcInVoltage = try? controller.dcInVoltage()
             temp = try? controller.batteryTemp()
             chargingOn = try controller.isChargingEnabled()
             adapterOn = try controller.isAdapterEnabled()
@@ -1397,7 +1700,7 @@ final class ChargeEngine: ObservableObject {
             sleepGuard.setPreventIdleSleep(false)
             chargeLegStartPercent = nil
             runtimeEstimator.reset()
-            DispatchQueue.main.async { self.snapshot.readError = "\(error)" }
+            DispatchQueue.main.async { self.publishReadError("\(error)") }
             return
         }
 
@@ -1423,42 +1726,15 @@ final class ChargeEngine: ObservableObject {
  // reading (nil batteryPower) can't feed the filter — reset so a stale
  // estimate never survives a telemetry gap. Remaining charge is a
  // separate per-tick read; its absence alone just hides the number.
-        if let bp = batteryPower {
-            runtimeEstimator.addSample(batteryPower: bp, dt: Self.tickInterval)
-        } else {
-            runtimeEstimator.reset()
-        }
-        let runtimeMinutes = runtimeEstimator.estimatedMinutes(
-            remainingMah: BatteryInfoReader.currentCapacity(),
-            voltage: batteryVolts)
-
- // Poll the macOS native limit: it caps everything we can do. The
- // plist changes when the user edits System Settings. Our configured
- // limit is clamped down to it — a setting above the system limit
- // would silently never take effect.
-        let sysLimit = macOSChargeLimit() ?? 100
-        DispatchQueue.main.async {
-            self.systemChargeLimit = sysLimit
-            if self.targetPercent > sysLimit { self.targetPercent = sysLimit }
-        }
+        let runtimeMinutes = estimateRuntime(batteryPower: batteryPower, batteryVolts: batteryVolts)
 
  // Wall-power presence: IOPowerSources OR the measured DC-in voltage.
  // While CHIE cuts the adapter input, IOPowerSources reports battery,
  // so a re-plug after a cut would be invisible to it forever; VD0R
  // keeps reading the negotiated PD voltage in that state (measured
- // 20.31 V with CHIE off) and is the direct physical signal. Without
- // the OR the delegation gate below deadlocks: delegation needs
- // acAttached, acAttached needs the adapter on, the adapter stays cut.
+ // 20.31 V with CHIE off) and is the direct physical signal.
         let acAttached = powerSources.acAttached
             || SessionRules.wallAttached(dcInVoltage: dcInVoltage)
-        let batteryChargePaused = BatteryInfoReader.chargePaused() ?? false
-
- // Low Power Mode mirror (public read-only API; the daemon owns
- // writes). Skipped briefly after a local toggle so the optimistic
- // value survives until pmset lands.
-        if Date().timeIntervalSince(lastLocalLPMWriteAt ?? .distantPast) > 3 {
-            lowPowerModeEnabled = ProcessInfo.processInfo.isLowPowerModeEnabled
-        }
 
  // Sleep-stop latch: lid still closed (sleep or a maintenance
  // DarkWake) — never write charging/adapter state; the pre-sleep cut
@@ -1473,13 +1749,13 @@ final class ChargeEngine: ObservableObject {
             prevPhase = phase
             chargeLegStartPercent = nil
             DispatchQueue.main.async {
-                self.snapshot = Snapshot(
+                self.publishSnapshot(Snapshot(
                     batteryPercent: pct, hardwareBatteryPercent: hardwarePct,
                     dcInPower: power, batteryTemp: temp,
                     batteryPower: batteryPower, hostPower: hostPower,
                     batteryVolts: batteryVolts, batteryAmps: batteryAmps,
                     runtimeEstimateMinutes: runtimeMinutes,
-                    chargingEnabled: chargingOn, phase: phase, readError: nil)
+                    chargingEnabled: chargingOn, phase: phase, readError: nil))
             }
             return
         }
@@ -1489,40 +1765,7 @@ final class ChargeEngine: ObservableObject {
  // sleep latch holds (lid closed / DarkWake maintenance wake).
  // Same-day catch-up happens naturally: dueRules sees any
  // occurrence whose time already passed today.
-        refreshWorkdayCalendarIfNeeded()
-        let scheduleYear = WorkdayCalendar.gregorianYear(for: Date(), calendar: .current)
-        let waitingForWorkdayCalendar = workdayCalendarRegion == .mainlandChina
-            && workdayCalendarClient.isLoading(year: scheduleYear)
-            && !workdayCalendarClient.hasCalendar(year: scheduleYear)
-        let rulesToEvaluate: [ScheduleRule]
-        if waitingForWorkdayCalendar {
- // Wait for the first complete regional calendar before deciding
- // whether a weekday rule is due. Other repeat modes are unaffected.
-            rulesToEvaluate = scheduleRules.filter {
-                if case .weekdays = $0.repeatMode { return false }
-                return true
-            }
-        } else {
-            rulesToEvaluate = scheduleRules
-        }
-        let due = schedule.dueRules(
-            rulesToEvaluate,
-            now: Date(),
-            calendar: .current,
-            workdayCalendar: scheduleWorkdayCalendar)
-        if !due.isEmpty {
-            for fired in due {
-                NSLog("[ChargeKit] schedule fired: \(fired.action) at "
-                    + String(format: "%02d:%02d", fired.hour, fired.minute)
-                    + " (\(String(describing: fired.repeatMode)))")
-                applyScheduled(fired.action, batteryPercent: pct)
-                if !fired.enabled, let i = scheduleRules.firstIndex(where: { $0.id == fired.id }) {
- // One-shot (never-repeat) rule spent: disable in place.
-                    scheduleRules[i].enabled = false
-                }
-            }
-            persistScheduleBookkeeping()
-        }
+        evaluateSchedule(batteryPercent: pct)
 
  // Track the daemon-owned discharge session (async; next tick uses it).
  // A true→false mirror transition is a completed drain — but only
@@ -1613,13 +1856,13 @@ final class ChargeEngine: ObservableObject {
             prevPhase = .discharging
             chargeLegStartPercent = nil
             DispatchQueue.main.async {
-                self.snapshot = Snapshot(
+                self.publishSnapshot(Snapshot(
                     batteryPercent: pct, hardwareBatteryPercent: hardwarePct,
                     dcInPower: power, batteryTemp: temp,
                     batteryPower: batteryPower, hostPower: hostPower,
                     batteryVolts: batteryVolts, batteryAmps: batteryAmps,
                     runtimeEstimateMinutes: runtimeMinutes,
-                    chargingEnabled: chargingOn, phase: .discharging, readError: nil)
+                    chargingEnabled: chargingOn, phase: .discharging, readError: nil))
             }
             return
         }
@@ -1663,32 +1906,6 @@ final class ChargeEngine: ObservableObject {
             config.sailBufferPercent = 1
         }
 
- // System delegation (26.7.3 firmware): with no user-writable
- // charging-switch keys the engine cannot stop charging without
- // cutting the adapter. When the macOS native charge limit equals the
- // effective target, delegate to it instead: the native limit holds
- // the battery at the target with wall power staying connected, which
- // the adapter-cut fallback cannot do. The engine only keeps the
- // adapter on and writes nothing else. A hot battery keeps the policy
- // path (heat pause needs the adapter cut executable).
-        let systemManaged = limitingEnabled
-            && SessionRules.systemManagedDelegation(
-                acAttached: acAttached,
-                chargingKeyAvailable: controller.chargingKey != nil,
-                systemChargeLimit: sysLimit,
-                effectiveTargetPercent: config.targetPercent)
-            && !SessionRules.heatThresholdExceeded(
-                batteryTemp: temp,
-                heatProtectionEnabled: config.heatProtectionEnabled,
-                heatThresholdC: config.heatThresholdC)
-        if systemManaged, !adapterOn {
-            HelperClient.shared.setAdapter(enabled: true) { [weak self] error in
-                DispatchQueue.main.async {
-                    self?.helperError = error.map { "\($0.localizedDescription)" }
-                }
-            }
-        }
-
         let decision = policy.evaluate(
             batteryPercent: pct, batteryTemp: temp,
             chargingOn: chargingOn, config: config)
@@ -1729,7 +1946,7 @@ final class ChargeEngine: ObservableObject {
             batteryVolts: batteryVolts, batteryAmps: batteryAmps,
             runtimeEstimateMinutes: runtimeMinutes,
             chargingEnabled: chargingOn, phase: decision.phase, readError: nil,
-            chargePaused: acAttached ? batteryChargePaused : false)
+            chargePaused: acAttached && (BatteryInfoReader.chargePaused() ?? false))
 
  // Without wall power the limiter is not actively doing anything and
  // the battery carries the machine — phase labels like "已停在 X%（适配器
@@ -1737,8 +1954,6 @@ final class ChargeEngine: ObservableObject {
  // session via dischargeActive.
         if !acAttached {
             newSnapshot.phase = .discharging
-        } else if systemManaged {
-            newSnapshot.phase = .systemManaged
         } else if newSnapshot.phase == .charging, newSnapshot.chargePaused {
             newSnapshot.phase = .chargePaused
         }
@@ -1762,14 +1977,6 @@ final class ChargeEngine: ObservableObject {
         }
         if newSnapshot.phase != .charging { chargeLegStartPercent = nil }
 
- // System-delegation edges (who is enforcing the limit right now).
-        if newSnapshot.phase == .systemManaged, prevPhase != .systemManaged {
-            recordHistory(.sessionStarted, "系统限充接管 · 上限 \(config.targetPercent)%")
-        }
-        if prevPhase == .systemManaged, newSnapshot.phase != .systemManaged {
-            recordHistory(.sessionCancelled, "系统限充交还引擎")
-        }
-
  // Heat-pause / release edges (history audit: "why did charging
  // stop/resume?").
         if newSnapshot.phase == .heatPaused, prevPhase != .heatPaused {
@@ -1784,44 +1991,13 @@ final class ChargeEngine: ObservableObject {
             recordHistory(.sessionStarted, "过热恢复充电")
         }
 
- // Adapter plug / unplug edges (physical events that change behavior).
-        if acAttached, prevACAttached == false {
-            recordHistory(.sessionStarted, "适配器已接入")
-        }
-        if !acAttached, prevACAttached == true {
-            recordHistory(.sessionCancelled, "适配器已拔出")
-        }
-        prevACAttached = acAttached
+        recordAdapterConnection(acAttached)
 
         prevPhase = newSnapshot.phase
 
- // Adapter restore by physical presence. IOPowerSources cannot be
- // trusted here: while CHIE cuts the input, ExternalConnected reads No,
- // so after an accidental cut (or a re-plug into it) every signal says
- // "on battery" forever and nothing would ever restore wall power.
- // VD0R keeps reporting the negotiated PD voltage in that state
- // (measured 20.31 V with CHIE off), so it is the cable-attached
- // signal. Restore only when no path intends the adapter off: a
- // discharge session, or the policy's own hold (sailing/heat) on
- // keyless firmware where stopping charge means cutting the adapter.
-        let adapterIntentionallyOff = dischargeActive
-            || (!systemManaged && decision.chargingOn == false)
-        if SessionRules.wallAttached(dcInVoltage: dcInVoltage),
-           !adapterOn, !adapterIntentionallyOff {
-            HelperClient.shared.setAdapter(enabled: true) { [weak self] error in
-                DispatchQueue.main.async {
-                    self?.helperError = error.map { "\($0.localizedDescription)" }
-                }
-            }
-        }
-
-        if !systemManaged, decision.chargingOn != chargingOn {
+        if controller.chargingKey != nil, decision.chargingOn != chargingOn {
             let wanted = decision.chargingOn
- // Never write a charging OFF while on battery: it is meaningless
- // without wall power, and on keyless firmware the fallback write cuts
- // the adapter, which then masks the re-plug (ExternalConnected stays
- // No). The on-battery tick skips the write; the first tick after the
- // cable returns converges back to the policy decision.
+ // A charging-off transition only applies while wall power is present.
             if wanted || acAttached {
                 HelperClient.shared.setCharging(enabled: wanted) { [weak self] error in
                     DispatchQueue.main.async {
@@ -1831,7 +2007,7 @@ final class ChargeEngine: ObservableObject {
                 newSnapshot.chargingEnabled = wanted
             }
         }
-        DispatchQueue.main.async { self.snapshot = newSnapshot }
+        DispatchQueue.main.async { self.publishSnapshot(newSnapshot) }
 
  // Native charge-limit stall: a full-charge leg is stalled only when
  // the policy itself wants a charge toward 100 (decision.chargingOn)
@@ -1873,40 +2049,14 @@ final class ChargeEngine: ObservableObject {
             self.fullChargeLegBlocked = self.nativeLimitStallActive
         }
 
- // MagSafe LED sync (industry-standard): green at the limit, orange
- // while charging toward it, off when the adapter is cut. The charge
- // must actually be flowing: on keyless firmware chargingEnabled falls
- // back to the adapter state (always on), and the native limit holds
- // the battery at the target with NotChargingReason set — an orange
- // LED there contradicts the menu bar. Read-compare against ACLC each
- // tick and re-assert only on mismatch — the system resets the key on
- // adapter replug.
-        if magsafeLedEnabled {
-            let expected: UInt8 = !adapterOn ? MagSafeColor.off
-                : (newSnapshot.chargingEnabled && !newSnapshot.chargePaused
-                    ? MagSafeColor.orange : MagSafeColor.green)
-            if let current = try? smc.read(SMCKey("ACLC")), current.first != expected {
-                lastMagSafeColor = expected
-                HelperClient.shared.setMagSafeColor(expected)
-            }
-        }
+        let expectedColor: UInt8 = !adapterOn ? MagSafeColor.off
+            : (newSnapshot.chargingEnabled && !newSnapshot.chargePaused
+                ? MagSafeColor.orange : MagSafeColor.green)
+        syncMagSafeColor(expectedColor, using: smc)
     }
 }
 
 // MARK: - UI
-
-/// Small gray section label - the first-party popover grouping idiom
-/// (Wi-Fi/Bluetooth popovers) instead of bare dividers between blocks.
-struct SectionHeader: View {
-    let title: String
-
-    var body: some View {
-        Text(title)
-            .font(.caption.weight(.semibold))
-            .foregroundColor(.secondary)
-            .accessibilityAddTraits(.isHeader)
-    }
-}
 
 /// System Settings slider idiom: label left, live value right, slider on
 /// its own full-width line (values align across rows).
@@ -1916,6 +2066,8 @@ struct SliderRow: View {
     let unit: String
     let range: ClosedRange<Double>
     let step: Double
+    var showsTickMarks = true
+    var allowsTextEntry = false
     let onEdit: (Int) -> Void
 
     var body: some View {
@@ -1923,28 +2075,93 @@ struct SliderRow: View {
             HStack {
                 Text(label)
                 Spacer()
-                Text("\(value)\(unit)")
-                    .foregroundColor(.secondary)
-                    .monospacedDigit()
+                if allowsTextEntry {
+                    SliderValueField(label: label, value: value, unit: unit, range: range, onEdit: onEdit)
+                } else {
+                    Text("\(value)\(unit)")
+                        .foregroundColor(.secondary)
+                        .monospacedDigit()
+                }
             }
             .font(.callout)
-            Slider(value: Binding(
-                get: { Double(value) },
-                set: { onEdit(Int($0)) }),
-                   in: range, step: step)
+            slider
                 .accessibilityLabel(Text(label))
                 .accessibilityValue(Text("\(value)\(unit)"))
         }
+    }
+
+    @ViewBuilder
+    private var slider: some View {
+        let binding = Binding(
+            get: { Double(value) },
+            set: { onEdit(Int($0.rounded())) })
+        if showsTickMarks {
+            Slider(value: binding, in: range, step: step)
+        } else {
+            Slider(value: binding, in: range)
+                .accessibilityRepresentation {
+                    Slider(value: binding, in: range, step: step)
+                        .accessibilityLabel(Text(label))
+                        .accessibilityValue(Text("\(value)\(unit)"))
+                }
+        }
+    }
+}
+
+private struct SliderValueField: View {
+    let label: String
+    let value: Int
+    let unit: String
+    let range: ClosedRange<Double>
+    let onEdit: (Int) -> Void
+    @State private var draft: String?
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        HStack(spacing: 4) {
+            TextField("", text: Binding(
+                get: { draft ?? String(value) },
+                set: { draft = $0 }))
+                .labelsHidden()
+                .textFieldStyle(.roundedBorder)
+                .multilineTextAlignment(.trailing)
+                .frame(width: 50)
+                .focused($isFocused)
+                .accessibilityLabel(Text(label))
+                .accessibilityHint(Text("整数部分须在 \(Int(range.lowerBound)) 到 \(Int(range.upperBound)) 之间，小数部分会舍去"))
+                .onSubmit {
+                    commit()
+                    isFocused = false
+                }
+                .onChange(of: isFocused) { focused in
+                    if !focused { commit() }
+                }
+                .onChange(of: value) { _ in draft = nil }
+                .onDisappear { commit() }
+            Text(unit)
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+        }
+        .monospacedDigit()
+    }
+
+    private func commit() {
+        guard let input = draft else { return }
+        draft = nil
+        let parts = input.split(separator: ".", omittingEmptySubsequences: false)
+        guard (1...2).contains(parts.count),
+              parts.allSatisfy({ !$0.isEmpty && $0.utf8.allSatisfy { (48...57).contains($0) } }),
+              let number = Int(parts[0]), range.contains(Double(number)) else {
+            NSSound.beep()
+            return
+        }
+        if number != value { onEdit(number) }
     }
 }
 
 struct PopoverView: View {
     @ObservedObject var engine: ChargeEngine
- /// Called right after the disclosure toggles so the AppDelegate can
- /// start the window interpolation in the same runloop turn as the
- /// state change (single clock — the chevron's tiny rotation is the
- /// only SwiftUI animation left in the popover).
-    var onBatteryInfoToggled: (@MainActor () -> Void)? = nil
+    var openSettings: @MainActor (SettingsPane?) -> Void = { _ in }
 
     var statusText: String { Self.statusText(for: engine.snapshot, engine: engine) }
 
@@ -1962,13 +2179,23 @@ struct PopoverView: View {
  // 续航估算只在真实放电时出现（状态行 + 电池信息遥测行共用同一份）。
         let runtimeSuffix = snapshot.runtimeEstimateMinutes
             .map { " · 剩余约 \(RuntimeText.short(minutes: $0))" } ?? ""
-        if let bp = snapshot.batteryPower, bp < -0.5, snapshot.phase != .discharging {
-            switch snapshot.phase {
-            case .holding, .charging:
-                return "电池放电中 · macOS 系统限制生效" + runtimeSuffix
-            default:
-                break
+        if snapshot.adapterRecoveryNeeded {
+            return "适配器已连接 · 正在恢复外接供电" + runtimeSuffix
+        }
+        if !engine.chargeControlMode.controlsCharging {
+            switch snapshot.systemPowerSource {
+            case .battery: return "电池供电" + runtimeSuffix
+            case .external:
+                switch snapshot.systemIsCharging {
+                case true?: return "适配器供电 · 正在充电"
+                case false?: return "适配器供电 · 未充电"
+                case nil: return "适配器供电"
+                }
+            case nil: return "供电状态暂不可用"
             }
+        }
+        if snapshot.isDrainingWhileChargeManaged {
+            return "电池放电中 · macOS 系统限制生效" + runtimeSuffix
         }
         switch snapshot.phase {
         case .idle:
@@ -1978,13 +2205,6 @@ struct PopoverView: View {
         case .chargePaused:
             return "充电已暂停 · macOS 优化充电中"
         case .holding:
- // Current percent lives in the merged header gauge once; the
- // menu-bar title carries it too. Only the semantics stay here. On
- // keyless firmware the hold cuts the adapter, so the battery powers
- // the machine — "适配器供电" would be wrong there.
-            if !engine.chargingSwitchAvailable {
-                return "已停在上限 · 电池供电 · 适配器已断开"
-            }
             return "已停在上限 · 适配器供电"
         case .heatPaused:
             let t = snapshot.batteryTemp.map { String(format: "%.1f", $0) } ?? "—"
@@ -1996,56 +2216,80 @@ struct PopoverView: View {
  // 放电会话的进度语义是"到目标电量"，混入"到空"的续航会误导。
             return "电池放电中 · 未接电源" + runtimeSuffix
         case .systemManaged:
-            return "macOS 系统限充管理中 → \(engine.targetPercent)%"
+            return "由 macOS 管理充电"
         }
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
- // Merged header: one element carries battery + state (gauge
- // capsule tinted by phase) + status text (no duplicated
- // percent) + temperature when heat protection is armed.
-            HStack(spacing: 8) {
-                BatteryGaugeView(
-                    percent: engine.snapshot.readError == nil
-                        ? engine.snapshot.batteryPercent : nil,
-                    phase: engine.snapshot.phase,
-                    lowPowerMode: engine.lowPowerModeEnabled)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(statusText)
-                        .font(.callout)
-                        .lineLimit(2)
-                        .fixedSize(horizontal: false, vertical: true)
-                    if engine.heatProtectionEnabled {
-                        HStack(spacing: 4) {
-                            Image(systemName: "thermometer.medium")
-                            Text(engine.snapshot.batteryTemp.map { String(format: "%.0f°C", $0) } ?? "—")
-                        }
-                        .font(.caption)
-                        .foregroundColor(.secondary)
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("电池")
+                        .font(.headline)
+                        .accessibilityAddTraits(.isHeader)
+                    Spacer()
+                    if engine.lowPowerModeEnabled {
+                        Label("低电量模式已开启", systemImage: "leaf.fill")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    BatteryGaugeView(
+                        percent: engine.snapshot.hasBatteryPercent
+                            ? engine.snapshot.batteryPercent : nil,
+                        phase: engine.snapshot.phase,
+                        lowPowerMode: engine.lowPowerModeEnabled)
+                }
+                Text(statusText)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack {
+                    Text("低电量模式")
+                        .accessibilityHidden(true)
+                    Spacer()
+                    Toggle("低电量模式", isOn: Binding(
+                        get: { engine.lowPowerModeSwitchValue },
+                        set: { engine.setLowPowerMode($0) }))
+                        .labelsHidden()
+                }
+                .padding(.top, 4)
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 10) {
+                if engine.chargeControlMode == .systemManaged {
+                    HStack {
+                        Text("充电上限由 macOS 管理")
+                        Spacer()
+                        Button("打开电池设置", action: openSystemBatterySettings)
+                    }
+                } else if engine.chargeControlMode == .monitoringOnly {
+                    Text("此 Mac 仅支持电池监控")
+                        .foregroundStyle(.secondary)
+                } else {
+                HStack {
+                    Text("限制充电")
+                        .accessibilityHidden(true)
+                    Spacer()
+                    Toggle("限制充电", isOn: $engine.limitingEnabled)
+                        .labelsHidden()
+                }
+                if engine.limitingEnabled {
+                    SliderRow(label: "充电上限", value: engine.targetPercent, unit: "%",
+                              range: 50...100, step: 5) {
+                        engine.targetPercent = $0
                     }
                 }
-            }
-            VStack(alignment: .leading, spacing: 10) {
-                SectionHeader(title: "充电")
                 if engine.calibrationActive {
-                    sessionStatus(title: "校准运行中",
-                                  icon: "arrow.triangle.2.circlepath",
-                                  tint: .purple) {
-                        engine.cancelCalibration()
-                    }
+                    Button("取消校准") { engine.cancelCalibration() }
+                        .buttonStyle(.bordered)
                 } else if engine.dischargeActive {
-                    sessionStatus(title: "放电至 \(engine.dischargeFloor ?? engine.targetPercent)%",
-                                  icon: "arrow.down.circle",
-                                  tint: .blue) {
-                        engine.cancelDischarge()
-                    }
+                    Button("取消放电") { engine.cancelDischarge() }
+                        .buttonStyle(.bordered)
                 } else if engine.topUpActive {
-                    sessionStatus(title: "充满中 → 100%",
-                                  icon: "bolt.fill",
-                                  tint: .green) {
-                        engine.cancelTopUp()
-                    }
+                    Button("取消充满") { engine.cancelTopUp() }
+                        .buttonStyle(.bordered)
                 } else if engine.limitingEnabled {
                     HStack(spacing: 8) {
                         Button {
@@ -2063,131 +2307,30 @@ struct PopoverView: View {
                         }
                     }
                     .buttonStyle(.bordered)
-                    .controlSize(.regular)
-                    .cardBackground()
                 }
-                Toggle("限制充电", isOn: $engine.limitingEnabled)
-                if engine.limitingEnabled {
-                    SliderRow(label: "上限", value: engine.targetPercent, unit: "%",
-                              range: 50...Double(max(engine.systemChargeLimit, 50)), step: 5) {
-                        engine.targetPercent = $0
-                    }
-                    if engine.targetPercent >= engine.systemChargeLimit, engine.systemChargeLimit < 100 {
-                        Text("已到 macOS 系统上限 \(engine.systemChargeLimit)% · 系统设置 → 电池可调高")
-                            .font(.caption2).foregroundColor(.secondary)
-                    }
-                    SliderRow(label: "缓冲", value: engine.sailBufferPercent, unit: "%",
-                              range: 2...15, step: 1) {
-                        engine.sailBufferPercent = $0
-                    }
-                    Text("达到 \(engine.targetPercent)% 停止充电 · 跌至 \(engine.targetPercent - engine.sailBufferPercent)% 恢复")
-                        .font(.caption2).foregroundColor(.secondary)
                 }
             }
 
-            PowerFlowView(
-                dcInPower: engine.snapshot.readError == nil ? engine.snapshot.dcInPower : 0,
-                batteryPower: engine.snapshot.readError == nil ? engine.snapshot.batteryPower : nil,
-                hostPower: engine.snapshot.readError == nil ? engine.snapshot.hostPower : nil)
-                .frame(height: 108)
+            Divider()
 
- // Disclosure built by hand (Button + chevron, no DisclosureGroup:
- // its internal animation can't be coordinated with). The panel
- // height is driven per tick by the AppDelegate resize timer
- // (single clock for window + content — engine.displayPanelHeight);
- // the background GeometryReader keeps the natural height measured
- // for the static state.
-            VStack(alignment: .leading, spacing: 8) {
+            HStack {
                 Button {
-                    engine.batteryInfoExpanded.toggle()
-                    onBatteryInfoToggled?()
+                    openSettings(.battery)
                 } label: {
-                    HStack(spacing: 4) {
-                        Label("电池信息", systemImage: "info.circle")
-                        Spacer()
-                        Image(systemName: "chevron.right")
-                            .rotationEffect(.degrees(engine.batteryInfoExpanded ? 90 : 0))
-                            .animation(.easeInOut(duration: 0.15),
-                                       value: engine.batteryInfoExpanded)
-                    }
-                    .contentShape(Rectangle())
+                    Label("电池信息", systemImage: "info.circle")
                 }
-                .buttonStyle(.plain)
-                .font(.caption.weight(.semibold))
-                .foregroundColor(.secondary)
-
- // Height-driven disclosure: the content stays in the layout
- // (fixedSize keeps it at natural height, so the background
- // GeometryReader measures it even while collapsed) and the
- // frame height follows engine.displayPanelHeight while the
- // resize timer runs, the static state otherwise. The footer
- // tracks the frame's bottom edge — no conditional insertion,
- // so nothing ever travels THROUGH the content's area.
-                BatteryInfoView(
-                    info: engine.batteryInfo,
-                    telemetry: engine.snapshot.readError == nil ? engine.snapshot : nil)
-                    .padding(.top, 2)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .background(
-                        GeometryReader { geo in
-                            Color.clear.preference(
-                                key: BatteryInfoHeightKey.self,
-                                value: geo.size.height)
-                        })
-                    .frame(height: engine.displayPanelHeight
-                           ?? (engine.batteryInfoExpanded
-                               ? (engine.batteryInfoHeight > 0 ? engine.batteryInfoHeight : nil)
-                               : 0),
-                           alignment: .top)
-                    .clipped()
-                    .opacity(engine.batteryInfoExpanded ? 1 : 0)
-                    .accessibilityHidden(!engine.batteryInfoExpanded)
+                Spacer()
+                Button {
+                    openSettings(nil)
+                } label: {
+                    Label("设置…", systemImage: "gearshape")
+                }
             }
+            .buttonStyle(.borderless)
         }
         .padding(16)
         .frame(width: 320)
         .toggleStyle(.switch)
- // No SwiftUI animation on the disclosure: the AppDelegate resize
- // timer drives the panel height per tick (engine.displayPanelHeight)
- // and the window follows the same tick — a single clock, so border,
- // content and footer cannot drift or wobble against each other.
-        .onPreferenceChange(BatteryInfoHeightKey.self) { engine.batteryInfoHeight = $0 }
-    }
-
- /// Session banner: colored icon + label in a soft rounded card with
- /// an inline cancel — reads as "running now" and stays visually
- /// grouped with the action buttons it replaces.
-    private func sessionStatus(
-        title: String, icon: String, tint: Color,
-        cancel: @escaping () -> Void
-    ) -> some View {
-        HStack(spacing: 8) {
-            Label(title, systemImage: icon)
-                .foregroundColor(tint)
-            Spacer()
-            Button("取消", action: cancel)
-                .buttonStyle(.borderless)
-        }
-        .cardBackground()
-    }
-}
-
- /// Soft container for the popover's action area: groups buttons and
- /// session banners above the plain form rows, adapting to light/dark.
-extension View {
-    func cardBackground() -> some View {
-        modifier(CardBackground())
-    }
-}
-
-private struct CardBackground: ViewModifier {
-    func body(content: Content) -> some View {
-        content
-            .padding(10)
-            .frame(maxWidth: .infinity)
-            .background(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(.quaternary))
     }
 }
 
@@ -2218,33 +2361,36 @@ private struct AboutView: View {
     }
 
     var body: some View {
-        VStack(spacing: 16) {
+        VStack(spacing: 14) {
             Image(nsImage: NSImage(named: NSImage.applicationIconName) ?? NSImage())
                 .resizable()
-                .frame(width: 96, height: 96)
+                .frame(width: 76, height: 76)
+                .accessibilityHidden(true)
 
-            VStack(spacing: 6) {
+            VStack(spacing: 4) {
                 Text("ChargeKit")
                     .font(.title2.weight(.semibold))
-                Text("\(appVersion) · Helper \(displayedHelperVersion)")
+                    .accessibilityAddTraits(.isHeader)
+                Text("版本 \(appVersion) · 构建 \(build)")
                     .font(.callout)
-                    .foregroundColor(.secondary)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
             }
 
-            VStack(spacing: 8) {
-                Text("延长 MacBook 电池寿命的充电限制工具")
-                    .font(.callout)
-                    .foregroundColor(.secondary)
-                Link(
-                    "https://github.com/HanYunChenLuo/ChargeKit",
-                    destination: URL(string: "https://github.com/HanYunChenLuo/ChargeKit")!)
-                    .font(.callout)
-            }
+            Text("MacBook 充电限制工具")
+                .font(.callout)
+                .multilineTextAlignment(.center)
 
-            Button("诊断信息") {
-                showDiagnostics(diagnosticsText)
+            Divider()
+
+            HStack(spacing: 16) {
+                Link("GitHub 项目", destination: URL(string: "https://github.com/HanYunChenLuo/ChargeKit")!)
+                Spacer()
+                Button("诊断信息…") {
+                    showDiagnostics(diagnosticsText)
+                }
+                .buttonStyle(.bordered)
             }
-            .buttonStyle(.bordered)
         }
         .padding(24)
         .frame(width: 340)
@@ -2287,10 +2433,6 @@ private struct DiagnosticsView: View {
     }
 }
 
-/// Popover root: a ScrollView that greedily fills whatever contentSize
-/// AppDelegate assigns to the popover (measured final content height, capped
-/// to the anchoring screen's visible frame — never covers the menu bar,
-/// never runs off the bottom; overflow scrolls).
  /// First-run auto-update confirmation: one headline, one short line,
  /// two buttons — no NSAlert chrome (empty buttons / suppression box).
 private struct AutoUpdatePromptView: View {
@@ -2340,27 +2482,16 @@ private struct AutoUpdatePromptView: View {
     }
 }
 
+/// Scrolls when the popover content exceeds the anchoring screen's available height.
 struct PopoverRootView: View {
-    @ObservedObject var engine: ChargeEngine
-    var onBatteryInfoToggled: (@MainActor () -> Void)? = nil
+    let engine: ChargeEngine
+    let openSettings: @MainActor (SettingsPane?) -> Void
 
     var body: some View {
- // No scroll indicators: overflow is rare (screen cap) and any brief
- // mid-animation size mismatch would flash one.
-        ScrollView(.vertical, showsIndicators: false) {
-            PopoverView(engine: engine, onBatteryInfoToggled: onBatteryInfoToggled)
+        ScrollView {
+            PopoverView(engine: engine, openSettings: openSettings)
         }
         .frame(width: 320)
-    }
-}
-
-/// Natural height of the battery-info panel (measured via the background
-/// GeometryReader inside the disclosure; always available because the
-/// content lays out at natural height even while collapsed).
-private struct BatteryInfoHeightKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
     }
 }
 
@@ -2421,59 +2552,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         popover.behavior = .transient
- // Disclosure toggle → single-clock resize: one 60 Hz timer drives
- // BOTH the window contentSize and the panel height published to
- // SwiftUI (its animation modifier is gone), starting synchronously
- // in the button action. One clock = border, content and footer
- // cannot phase-wobble against each other.
-        let animateDisclosure: @MainActor () -> Void = { [weak self] in
-            guard let self else { return }
-            let natural = self.engine.batteryInfoHeight
- // Start from the CURRENT panel height: a retoggle mid-animation
- // reverses smoothly instead of jumping to an endpoint.
-            let startPanel = self.engine.displayPanelHeight
-                ?? (self.engine.batteryInfoExpanded ? 0 : natural)
-            let endPanel: CGFloat = self.engine.batteryInfoExpanded ? natural : 0
-            let baseTotal = self.popover.contentSize.height - startPanel
-            let available = (self.anchorScreen ?? NSScreen.main)?.visibleFrame.height ?? 800
-            let cap = max(available - Self.popoverChrome, 100)
-            self.animatePopoverResize(
-                tick: { [weak self] progress in
-                    guard let self else { return }
- // Whole points only: fractional window geometry makes
- // the popover origin (arrow attachment) wobble per tick.
-                    let panel = (startPanel + (endPanel - startPanel) * progress).rounded()
-                    self.engine.displayPanelHeight = panel
-                    let total = min(baseTotal + panel, cap).rounded()
-                    if total != self.popover.contentSize.height {
-                        self.popover.contentSize = NSSize(width: 320, height: total)
-                    }
-                },
-                onEnd: { [weak self] in
-                    self?.engine.displayPanelHeight = nil
-                })
-        }
         popover.contentViewController = NSHostingController(
-            rootView: PopoverRootView(
-                engine: engine,
-                onBatteryInfoToggled: animateDisclosure))
- // Hidden off-window measurer: gives the popover's FINAL content
- // height — its layout runs at the animation target, so the answer
- // is available the moment the disclosure state flips.
+            rootView: PopoverRootView(engine: engine) { [weak self] pane in
+                self?.showSettings(pane: pane)
+            })
         measurer = NSHostingController(rootView: PopoverView(engine: engine))
         measurer.view.frame = NSRect(x: 0, y: 0, width: 320, height: 100)
 
- // Any other height-affecting engine change (session banners, text
- // reflow): measure the final height and animate the window to it,
- // capped to the anchoring screen. The same-end guard below keeps a
- // routine re-measure (several publishes per tick carry the same
- // height) from arming an idle 60 Hz timer — and, worse, from
- // having the in-flight guard drop a REAL height change that lands
- // within the same 250 ms window.
+        // Combine the publishers from a single tick into one layout pass.
         engine.objectWillChange
-            .receive(on: DispatchQueue.main)
+            .debounce(for: .milliseconds(16), scheduler: DispatchQueue.main)
             .sink { [weak self] _ in
-                DispatchQueue.main.async { self?.updatePopoverHeight() }
+                guard let self else { return }
+                self.updateStatusBar(self.engine.snapshot)
+                self.updatePopoverHeight()
             }
             .store(in: &cancellables)
 
@@ -2484,13 +2576,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.target = self
         }
 
- // Menu bar: state symbol + live battery percent.
-        engine.$snapshot
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] snapshot in
-                self?.updateStatusBar(snapshot)
-            }
-            .store(in: &cancellables)
+        updateStatusBar(engine.snapshot)
 
  // Ensure the root helper is installed; one-time admin prompt.
         HelperInstaller.shared.installIfNeeded { error in
@@ -2544,11 +2630,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @MainActor
-    private func showSettings() {
+    private func showSettings(pane: SettingsPane? = nil) {
         popover.performClose(nil)
         if settingsWindowController == nil {
             settingsWindowController = SettingsWindowController(
                 engine: engine, updater: updaterController.updater)
+        }
+        if let pane {
+            settingsWindowController?.showPane(pane)
         }
         NSApp.activate(ignoringOtherApps: true)
  // Reopen on the screen the status item lives on, like system
@@ -2652,6 +2741,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc @MainActor
     private func showAbout() {
+        popover.performClose(nil)
         NSApp.activate(ignoringOtherApps: true)
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
         let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? ""
@@ -2663,16 +2753,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self?.showDiagnosticsWindow(text)
                 }))
             let window = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 340, height: 350),
+                contentRect: NSRect(x: 0, y: 0, width: 340, height: 260),
                 styleMask: [.titled, .closable],
                 backing: .buffered,
                 defer: false)
             window.title = "关于 ChargeKit"
             window.isReleasedWhenClosed = false
             window.contentViewController = contentController
+            window.center()
             aboutWindow = window
         }
-        aboutWindow?.center()
         aboutWindow?.makeKeyAndOrderFront(nil)
     }
 
@@ -2707,34 +2797,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         showSettings()
     }
 
-    private var lastMenuBarPhase: ChargePhase?
+    private var lastMenuBarIcon: MenuBarStatusIcon?
+    private var lastMenuBarTitle: String?
 
     private func updateStatusBar(_ snapshot: ChargeEngine.Snapshot) {
         guard let button = statusItem.button else { return }
-        let title = snapshot.readError == nil
+        let title = snapshot.hasBatteryPercent
             ? "\(Int(snapshot.batteryPercent))%"
             : "—%"
-        let phase = snapshot.phase
-
- // Rebuild the tinted symbol only when the phase actually changes;
- // off-screen rasterizing on every 2 s tick is wasted work.
-        if phase != lastMenuBarPhase {
-            lastMenuBarPhase = phase
-            if let colored = phase.menuBarImage {
-                button.image = colored
-            } else if let template = NSImage(systemSymbolName: phase.symbolName,
-                                             accessibilityDescription: nil) {
-                template.isTemplate = true
-                button.image = template
-            }
+        let lowPowerMode = engine.lowPowerModeEnabled
+        let icon = MenuBarStatusIcon(
+            phase: snapshot.isDrainingWhileChargeManaged ? .discharging : snapshot.phase,
+            readFailed: snapshot.readError != nil,
+            lowPowerMode: lowPowerMode)
+        if icon != lastMenuBarIcon {
+            lastMenuBarIcon = icon
+            button.image = icon.makeImage()
         }
-        let attrs: [NSAttributedString.Key: Any] =
-            phase.menuBarImage == nil
-            ? [.font: NSFont.menuBarFont(ofSize: 0)]
-            : [.font: NSFont.menuBarFont(ofSize: 0),
-               .foregroundColor: phase.statusColor]
-        button.attributedTitle = NSAttributedString(string: title, attributes: attrs)
-        button.toolTip = PopoverView.statusText(for: snapshot, engine: engine)
+        if title != lastMenuBarTitle {
+            lastMenuBarTitle = title
+            button.title = title
+        }
+        let status = PopoverView.statusText(for: snapshot, engine: engine)
+        let tooltip = lowPowerMode ? "低电量模式已开启 · \(status)" : status
+        if button.toolTip != tooltip { button.toolTip = tooltip }
     }
 
     @objc private func togglePopover() {
@@ -2806,10 +2892,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
  /// animate through the shared resize interpolator; the force path
  /// applies instantly so the popover opens at the right size.
     private func updatePopoverHeight(force: Bool = false) {
- // While a resize animation runs, its per-tick engine publishes
- // would retarget this path every tick — the animation owns the
- // window until it finishes.
-        if resizeTimer?.isValid == true { return }
+        if force {
+            resizeTimer?.invalidate()
+            resizeTimer = nil
+        } else if resizeTimer?.isValid == true {
+            return
+        }
  // Skip while closed: the measurer's layout pass costs real CPU per
  // engine tick for nothing.
         guard force || popover.isShown else { return }
@@ -2841,40 +2929,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
  // MARK: Self-driven popover resize
 
  /// NSPopover.contentSize sets apply INSTANTLY on this OS — there is no
- /// built-in resize animation (measured) — so the
- /// window is interpolated here. The SAME tick also drives the SwiftUI
- /// panel height for the disclosure (engine.displayPanelHeight; no
- /// SwiftUI animation modifier): one clock for border, content and
- /// footer, so the two update streams cannot phase-wobble.
+ /// built-in resize animation, so the window height is interpolated here.
     private var resizeTimer: Timer?
-    private var resizeBegan = Date.distantPast
-    private var resizeTick: ((CGFloat) -> Void)?
-    private var resizeOnEnd: (() -> Void)?
     private static let resizeDuration: TimeInterval = 0.25
 
- /// `tick` receives the eased progress (0…1) and applies it; `onEnd`
- /// runs once the animation completes (or is replaced by a new one,
- /// which drops the old end handler with it).
-    private func animatePopoverResize(tick: @escaping (CGFloat) -> Void,
-                                      onEnd: @escaping () -> Void = {}) {
+    private func animatePopoverResize(tick: @escaping (CGFloat) -> Void) {
         resizeTimer?.invalidate()
-        resizeBegan = Date()
-        resizeTick = tick
-        resizeOnEnd = onEnd
+        let began = Date()
  // .common so slider drags and menu tracking cannot stall the
  // animation (scheduledTimer's default mode pauses
  // during event tracking).
-        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            let t = min(Date().timeIntervalSince(self.resizeBegan) / Self.resizeDuration, 1)
-            self.resizeTick?(Self.easeInOut(t))
+        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] timer in
+            guard let self, self.popover.isShown else {
+                timer.invalidate()
+                self?.resizeTimer = nil
+                return
+            }
+            let t = min(Date().timeIntervalSince(began) / Self.resizeDuration, 1)
+            tick(Self.easeInOut(t))
             if t >= 1 {
-                self.resizeTimer?.invalidate()
+                timer.invalidate()
                 self.resizeTimer = nil
-                let end = self.resizeOnEnd
-                self.resizeTick = nil
-                self.resizeOnEnd = nil
-                end?()
+                // Pick up height changes that arrived during the animation.
+                self.updatePopoverHeight()
             }
         }
         RunLoop.main.add(timer, forMode: .common)

@@ -1,42 +1,52 @@
 import SwiftUI
 
-/// Battery health + telemetry details (parity info block), shared
-/// by the menu-bar popover (inside the height-animated disclosure) and the
-/// Settings window's charging pane. All data comes from public sources:
-/// AppleSmartBattery IORegistry properties (BatteryInfoReader),
-/// IOPowerSources (macOS gauge percent) and the live SMC gauge keys carried
-/// in the engine snapshot.
+/// Read-only battery pane. Health and macOS gauge data remain available
+/// independently of the live SMC snapshot.
 struct BatteryInfoView: View {
     let info: BatteryInfo
- /// Live SMC telemetry; nil on a read error (rows show "—").
     let telemetry: ChargeEngine.Snapshot?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            VStack(alignment: .leading, spacing: 6) {
-                SectionHeader(title: "电池健康")
+        Form {
+            Section("电源流向") {
+                if let telemetry {
+                    PowerFlowView(
+                        dcInPower: telemetry.dcInPower,
+                        batteryPower: telemetry.batteryPower,
+                        hostPower: telemetry.hostPower)
+                        .frame(height: 108)
+                } else {
+                    Label("实时功率暂不可用", systemImage: "bolt.slash")
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Section("电池健康") {
+                InfoRow(label: "健康度",
+                        value: info.healthPercent.map { "\($0)%" } ?? "—")
                 InfoRow(label: "设计容量",
                         value: info.designCapacitymAh.map { "\($0) mAh" } ?? "—")
-                InfoRow(label: "最大容量", value: maxCapacity)
-                InfoRow(label: "电量（硬件 / macOS）", value: dualPercent)
+                InfoRow(label: "估算满充容量", value: maxCapacity)
                 InfoRow(label: "循环次数",
                         value: info.cycleCount.map { "\($0)" } ?? "—")
                 if let serial = info.serial {
                     InfoRow(label: "序列号", value: serial, monospacedValue: true)
                 }
             }
-            Divider()
-            VStack(alignment: .leading, spacing: 6) {
-                SectionHeader(title: "遥测明细")
-                InfoRow(label: "输入功率", value: watts(telemetry?.dcInPower))
-                InfoRow(label: "适配器", value: adapterText)
-                InfoRow(label: "电池", value: batteryText)
+
+            Section("实时读数") {
+                InfoRow(label: "电量（硬件 / macOS）", value: dualPercent)
                 InfoRow(label: "电池温度",
                         value: telemetry?.batteryTemp.map { String(format: "%.1f°C", $0) } ?? "—")
-                InfoRow(label: "主机负载", value: watts(telemetry?.hostPower))
                 InfoRow(label: "续航估算", value: runtimeText)
+                InfoRow(label: "输入功率", value: watts(telemetry?.dcInPower))
+                InfoRow(label: "主机负载", value: watts(telemetry?.hostPower))
+                InfoRow(label: "电池电压 / 电流", value: batteryText)
+                InfoRow(label: "适配器协商档位", value: adapterText)
             }
         }
+        .formStyle(.grouped)
+        .padding(.horizontal, 12)
     }
 
  /// Derived full-charge capacity (design × health), marked approximate:
@@ -45,7 +55,7 @@ struct BatteryInfoView: View {
         guard let design = info.designCapacitymAh,
               let health = info.healthPercent else { return "—" }
         let mah = (Double(design) * Double(health) / 100).rounded()
-        return "≈\(Int(mah)) mAh · \(health)%"
+        return "≈\(Int(mah)) mAh"
     }
 
     private var dualPercent: String {
@@ -53,7 +63,7 @@ struct BatteryInfoView: View {
  // the same value twice under the default macOS basis (review
  // round 2, P1-3).
         let hardware = telemetry?.hardwareBatteryPercent
-            .flatMap { String(format: "%.0f%%", $0) } ?? "—"
+            .map { String(format: "%.0f%%", $0) } ?? "—"
         let macos = info.macosPercent.map { "\($0)%" } ?? "—"
         return "\(hardware) / \(macos)"
     }
@@ -63,10 +73,18 @@ struct BatteryInfoView: View {
     private var adapterText: String {
         switch (info.adapterVolts, info.adapterWatts) {
         case let (volts?, watts?):
-            return "\(Int(volts)) V · \(watts) W（协商档）"
-        default:
-            return "未连接"
+            return "\(voltageText(volts)) · \(watts) W"
+        case let (volts?, nil):
+            return voltageText(volts)
+        case let (nil, watts?):
+            return "\(watts) W"
+        case (nil, nil):
+            return "—"
         }
+    }
+
+    private func voltageText(_ volts: Double) -> String {
+        "\(volts.formatted(.number.precision(.fractionLength(0...2)))) V"
     }
 
     private var batteryText: String {
@@ -93,21 +111,18 @@ struct BatteryInfoView: View {
 private struct InfoRow: View {
     let label: String
     let value: String
- /// Full monospaced design for tech strings (serial number).
     var monospacedValue = false
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline) {
-            Text(label)
-                .foregroundColor(.secondary)
-            Spacer(minLength: 12)
+        LabeledContent {
             Text(value)
                 .monospacedDigit()
                 .multilineTextAlignment(.trailing)
                 .font(monospacedValue ? .system(.callout, design: .monospaced) : nil)
+        } label: {
+            Text(label)
+                .foregroundColor(.secondary)
         }
- // Matches SliderRow, the app's label/value rhythm in both the
- // popover and the settings panes.
         .font(.callout)
     }
 }

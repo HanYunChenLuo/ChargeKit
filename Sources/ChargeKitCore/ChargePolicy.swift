@@ -179,23 +179,48 @@ public enum SessionRules {
         return v > 4.5
     }
 
- /// Delegate charge limiting to the macOS native charge limit on
- /// firmware without user-writable charging-switch keys. The native
- /// limit holds the battery AT the target with the adapter still
- /// powering the machine — strictly better than the adapter-cut
- /// fallback, which drains the battery down to the sailing bottom each
- /// cycle. Only exact matches qualify: with the native limit above the
- /// target (its UI floor is 80%) the battery would overshoot, and heat
- /// protection needs the adapter cut executable, so neither may
- /// delegate. Measured on 26.7.3: CHTE/CH0C are gone from the key
- /// table and every remaining CH* key except CHIE is read-only.
-    public static func systemManagedDelegation(
-        acAttached: Bool,
-        chargingKeyAvailable: Bool,
-        systemChargeLimit: Int,
-        effectiveTargetPercent: Int
-    ) -> Bool {
-        acAttached && !chargingKeyAvailable && systemChargeLimit == effectiveTargetPercent
+    public enum ChargeControlMode: Equatable {
+        case systemManaged
+        case independentSwitch
+        case monitoringOnly
+
+        public init(nativeLimitSupported: Bool, independentSwitchAvailable: Bool) {
+            if nativeLimitSupported {
+                self = .systemManaged
+            } else {
+                self = independentSwitchAvailable ? .independentSwitch : .monitoringOnly
+            }
+        }
+
+        public var controlsCharging: Bool { self == .independentSwitch }
+
+        public enum AdapterRecovery: Equatable {
+            case none
+            case restore
+            case probe
+        }
+
+        public func adapterRecovery(
+            adapterEnabled: Bool?, dcInVoltage: Double?, externalPower: Bool, hasBattery: Bool,
+            awaitingPowerConfirmation: Bool = false
+        ) -> AdapterRecovery {
+            guard !controlsCharging else { return .none }
+            let voltageIndicatesConnection = SessionRules.wallAttached(dcInVoltage: dcInVoltage)
+            if adapterEnabled == false {
+                return externalPower || voltageIndicatesConnection ? .restore : .probe
+            }
+            guard !externalPower else { return .none }
+            let voltageUnavailable = dcInVoltage?.isFinite != true
+            if awaitingPowerConfirmation, voltageIndicatesConnection || voltageUnavailable {
+                // The switch can read back enabled before external power
+                // is usable. Keep the bounded probe active until confirmed.
+                return .probe
+            }
+            if adapterEnabled == nil, voltageIndicatesConnection || (hasBattery && voltageUnavailable) {
+                return .probe
+            }
+            return .none
+        }
     }
 
  // MARK: S7: sleep / auto-discharge predicates

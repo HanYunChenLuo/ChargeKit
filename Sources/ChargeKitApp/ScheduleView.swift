@@ -108,59 +108,56 @@ struct ScheduleSection: View {
     @State private var pendingDeletion: ScheduleRule?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                SectionHeader(title: "定时")
-                Spacer()
-                Button {
-                    editingRule = ScheduleRuleDraft(
-                        rule: engine.makeScheduleRuleDraft(),
-                        isNew: true)
-                } label: {
-                    Image(systemName: "plus.circle")
-                }
-                .buttonStyle(.borderless)
-                .help("添加定时任务（错过时间当天内唤醒会补做）")
-                .accessibilityLabel(Text("添加定时任务"))
-            }
-            HStack(alignment: .top, spacing: 12) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("工作日地区")
-                        .font(.callout)
-                    Text(engine.workdayCalendarStatus)
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer(minLength: 4)
+        Form {
+            Section {
                 Picker("工作日地区", selection: $engine.workdayCalendarRegion) {
                     ForEach(WorkdayCalendarRegion.allCases) { region in
                         Text(region.title).tag(region)
                     }
                 }
-                .labelsHidden()
                 .pickerStyle(.menu)
-                .accessibilityLabel(Text("工作日地区"))
+            } header: {
+                Text("工作日历")
+            } footer: {
+                Text(engine.workdayCalendarStatus)
             }
-            if engine.scheduleRules.isEmpty {
-                Text("无定时任务")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-            ForEach(engine.scheduleRules) { rule in
-                ScheduleRuleSummaryRow(
-                    rule: rule,
-                    onToggle: { enabled in
-                        engine.setScheduleRuleEnabled(rule.id, enabled: enabled)
-                    },
-                    onEdit: {
-                        editingRule = ScheduleRuleDraft(rule: rule, isNew: false)
-                    },
-                    onDelete: {
-                        pendingDeletion = rule
-                    })
+            Section {
+                if engine.scheduleRules.isEmpty {
+                    Text("暂无定时任务")
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(engine.scheduleRules) { rule in
+                    ScheduleRuleSummaryRow(
+                        rule: rule,
+                        available: engine.supportsScheduleAction(rule.action),
+                        onToggle: { enabled in
+                            engine.setScheduleRuleEnabled(rule.id, enabled: enabled)
+                        },
+                        onEdit: {
+                            editingRule = ScheduleRuleDraft(rule: rule, isNew: false)
+                        },
+                        onDelete: {
+                            pendingDeletion = rule
+                        })
+                }
+                Button {
+                    editingRule = ScheduleRuleDraft(
+                        rule: engine.makeScheduleRuleDraft(),
+                        isNew: true)
+                } label: {
+                    Label("添加定时任务…", systemImage: "plus")
+                }
+            } header: {
+                Text("定时任务")
+            } footer: {
+                Text("错过的任务会在当天唤醒时补做。")
+                if !engine.chargeControlMode.controlsCharging {
+                    Text("当前充电模式仅执行低电量模式任务。")
+                }
             }
         }
+        .formStyle(.grouped)
+        .padding(.horizontal, 12)
         .sheet(item: $editingRule) { request in
             ScheduleRuleEditor(
                 engine: engine,
@@ -244,6 +241,7 @@ private struct ScheduleRuleDraft: Identifiable {
 
 private struct ScheduleRuleSummaryRow: View {
     let rule: ScheduleRule
+    let available: Bool
     let onToggle: (Bool) -> Void
     let onEdit: () -> Void
     let onDelete: () -> Void
@@ -265,6 +263,7 @@ private struct ScheduleRuleSummaryRow: View {
                     get: { rule.enabled },
                     set: onToggle))
                     .labelsHidden()
+                    .disabled(!available)
                     .help(rule.enabled ? "已启用" : "已停用")
                     .accessibilityLabel(Text("启用此定时任务"))
                     .accessibilityValue(Text(rule.enabled ? "已启用" : "已停用"))
@@ -272,6 +271,11 @@ private struct ScheduleRuleSummaryRow: View {
             HStack {
                 Text(actionDescription)
                     .font(.callout)
+                if !available {
+                    Text("当前不可执行")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
                 Spacer(minLength: 4)
                 RowIconButton(
                     systemImage: "pencil",
@@ -284,8 +288,7 @@ private struct ScheduleRuleSummaryRow: View {
                     action: onDelete)
             }
         }
-        .padding(10)
-        .background(RoundedRectangle(cornerRadius: 8).fill(.quinary))
+        .padding(.vertical, 4)
     }
 
     private var repeatDescription: String {
@@ -394,7 +397,10 @@ private struct ScheduleRuleEditor: View {
 
                 Section("动作") {
                     Picker("动作", selection: actionKind) {
-                        ForEach(ScheduleActionKind.allCases) {
+                        ForEach(ScheduleActionKind.allCases.filter {
+                            $0 == ScheduleActionKind.of(draft.action)
+                                || engine.supportsScheduleAction($0.makeAction(from: draft.action))
+                        }) {
                             Text($0.rawValue).tag($0)
                         }
                     }
