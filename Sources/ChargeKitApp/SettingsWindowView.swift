@@ -3,8 +3,9 @@ import SwiftUI
 import ChargeKitCore
 import Sparkle
 
-private enum SettingsPane: String, CaseIterable {
+enum SettingsPane: String, CaseIterable {
     case charging
+    case battery
     case schedule
     case history
     case general
@@ -12,6 +13,7 @@ private enum SettingsPane: String, CaseIterable {
     var title: String {
         switch self {
         case .charging: return "充电"
+        case .battery: return "电池"
         case .schedule: return "定时"
         case .history: return "历史"
         case .general: return "通用"
@@ -20,11 +22,16 @@ private enum SettingsPane: String, CaseIterable {
 
     var symbol: String {
         switch self {
-        case .charging: return "battery.100percent"
+        case .charging: return "bolt.fill"
+        case .battery: return "battery.100percent"
         case .schedule: return "calendar"
         case .history: return "clock.arrow.circlepath"
         case .general: return "gearshape"
         }
+    }
+
+    var windowTitle: String {
+        self == .battery ? "电池信息" : "\(title)设置"
     }
 }
 
@@ -59,7 +66,7 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
         window.standardWindowButton(.zoomButton)?.isEnabled = false
         window.collectionBehavior = [.fullScreenAuxiliary]
         window.isReleasedWhenClosed = false
-        window.title = "\(selectedPane.title)设置"
+        window.title = selectedPane.windowTitle
         let contentController = NSHostingController(
             rootView: SettingsPaneView(engine: engine, updater: updater, pane: selectedPane))
         self.contentController = contentController
@@ -137,7 +144,8 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
         showPane(SettingsPane.allCases[index])
     }
 
-    private func showPane(_ pane: SettingsPane) {
+    func showPane(_ pane: SettingsPane) {
+        guard pane != selectedPane else { return }
         selectedPane = pane
         UserDefaults.standard.set(pane.rawValue, forKey: Self.selectedPaneKey)
         if let index = SettingsPane.allCases.firstIndex(of: pane) {
@@ -146,7 +154,7 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
         guard let window else { return }
         let frame = window.frame
         contentController.rootView = SettingsPaneView(engine: engine, updater: updater, pane: pane)
-        window.title = "\(pane.title)设置"
+        window.title = pane.windowTitle
  // Reuse the installed controller and preserve the complete frame.
  // Replacing contentViewController reattaches the host view and can
  // make AppKit recompute its screen-relative origin on toolbar clicks.
@@ -158,6 +166,7 @@ private struct SettingsPaneView: View {
     @ObservedObject var engine: ChargeEngine
     let updater: SPUUpdater
     let pane: SettingsPane
+    @State private var confirmingClearHistory = false
 
  /// Semantic color for the live heat reading: green in the safe band,
  /// orange inside the hysteresis zone, red at/over the threshold.
@@ -172,7 +181,7 @@ private struct SettingsPaneView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if let error = engine.helperError {
+            if pane != .battery, let error = engine.helperError {
                 Label("助手连接失败：\(error)", systemImage: "exclamationmark.triangle.fill")
                     .font(.callout)
                     .foregroundColor(.red)
@@ -191,11 +200,12 @@ private struct SettingsPaneView: View {
         switch pane {
         case .charging:
             chargingPane
+        case .battery:
+            BatteryInfoView(
+                info: engine.batteryInfo,
+                telemetry: engine.snapshot.hasTelemetry ? engine.snapshot : nil)
         case .schedule:
-            ScrollView {
-                ScheduleSection(engine: engine)
-                    .padding(20)
-            }
+            ScheduleSection(engine: engine)
         case .history:
             historyPane
         case .general:
@@ -203,22 +213,43 @@ private struct SettingsPaneView: View {
         }
     }
 
+    @ViewBuilder
     private var chargingPane: some View {
+        if engine.chargeControlMode.controlsCharging {
+            legacyChargingPane
+        } else {
+            Form {
+                Section("充电管理") {
+                    if engine.chargeControlMode == .systemManaged {
+                        LabeledContent("充电上限", value: "由 macOS 管理")
+                        Button("打开电池设置", action: openSystemBatterySettings)
+                        Text("需要满电时，可在 macOS 电池菜单选择「立即充满」。")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("此 Mac 仅支持电池监控。")
+                    }
+                }
+            }
+            .formStyle(.grouped)
+        }
+    }
+
+    private var legacyChargingPane: some View {
         Form {
-            Section("充电上限") {
+            Section {
                 Toggle("限制充电", isOn: $engine.limitingEnabled)
                 if engine.limitingEnabled {
                     SliderRow(
                         label: "上限",
                         value: engine.targetPercent,
                         unit: "%",
-                        range: 50...Double(max(engine.systemChargeLimit, 50)),
+                        range: 50...100,
                         step: 5
                     ) {
                         engine.targetPercent = $0
                     }
                     SliderRow(
-                        label: "缓冲",
+                        label: "充电缓冲",
                         value: engine.sailBufferPercent,
                         unit: "%",
                         range: 2...15,
@@ -226,15 +257,12 @@ private struct SettingsPaneView: View {
                     ) {
                         engine.sailBufferPercent = $0
                     }
-                    Text("达到 \(engine.targetPercent)% 停止充电 · 跌至 \(engine.targetPercent - engine.sailBufferPercent)% 恢复")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                    if engine.systemChargeLimit < 100,
-                       engine.targetPercent >= engine.systemChargeLimit {
-                        Text("已到 macOS 系统上限 \(engine.systemChargeLimit)% · 可在系统设置的电池页面调高")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
+                }
+            } header: {
+                Text("充电上限")
+            } footer: {
+                if engine.limitingEnabled {
+                    Text("达到 \(engine.targetPercent)% 停止充电，降至 \(engine.targetPercent - engine.sailBufferPercent)% 恢复。")
                 }
             }
 
@@ -270,7 +298,7 @@ private struct SettingsPaneView: View {
                         Text("达到阈值暂停充电 · 温度下降 \(Int(ChargeConfig.heatHysteresisC))°C 后恢复")
                             .foregroundColor(.secondary)
                         Spacer()
-                        if let temp = engine.snapshot.batteryTemp {
+                        if engine.snapshot.hasTelemetry, let temp = engine.snapshot.batteryTemp {
                             Text(String(format: "当前 %.1f°C", temp))
                                 .monospacedDigit()
                                 .foregroundStyle(heatStatusColor(temp))
@@ -319,12 +347,6 @@ private struct SettingsPaneView: View {
                 }
             }
 
-            Section("电池信息") {
-                BatteryInfoView(
-                    info: engine.batteryInfo,
-                    telemetry: engine.snapshot.readError == nil ? engine.snapshot : nil)
-            }
-
             if engine.nativeLimitStalled {
                 Section("macOS 充电上限") {
                     Label("系统上限阻止本次充满", systemImage: "exclamationmark.triangle.fill")
@@ -361,14 +383,13 @@ private struct SettingsPaneView: View {
     }
 
     private var historyPane: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 0) {
-                if engine.actionHistory.isEmpty {
-                    Text("暂无记录")
-                        .font(.callout)
-                        .foregroundColor(.secondary)
-                        .padding(.top, 40)
-                } else {
+        VStack(spacing: 0) {
+            if engine.actionHistory.isEmpty {
+                Label("暂无操作记录", systemImage: "clock")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List {
                     ForEach(engine.actionHistory) { entry in
                         HStack(alignment: .top, spacing: 12) {
  // Apple Settings/Notifications pattern: colored
@@ -389,22 +410,27 @@ private struct SettingsPaneView: View {
                             }
                             Spacer(minLength: 0)
                         }
-                        .padding(.horizontal, 20)
                         .padding(.vertical, 5)
                         .help(entry.timestamp.formatted(
                             .dateTime.year().month().day().hour().minute().second()))
                     }
                 }
+                .listStyle(.inset)
+
+                Divider()
+                HStack {
+                    Spacer()
+                    Button("清除历史…") { confirmingClearHistory = true }
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 12)
             }
-            .padding(.vertical, 12)
         }
-        .overlay(alignment: .bottomTrailing) {
-            if !engine.actionHistory.isEmpty {
-                Button("清除历史") { engine.clearHistory() }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .padding()
-            }
+        .alert("清除所有历史记录？", isPresented: $confirmingClearHistory) {
+            Button("取消", role: .cancel) {}
+            Button("清除历史", role: .destructive) { engine.clearHistory() }
+        } message: {
+            Text("清除后无法恢复。")
         }
     }
 
@@ -415,10 +441,38 @@ private struct SettingsPaneView: View {
                     .help("开启后充电限制、航海模式、放电等功能以电池管理系统直报电量为基准；关闭时使用 macOS 显示电量，与系统菜单栏一致，两者最多可相差 7%")
                 Toggle("MagSafe 指示灯", isOn: $engine.magsafeLedEnabled)
                     .help("到上限变绿、充电中变橙、断电熄灭；睡眠时由系统接管")
-                Toggle("省电模式", isOn: Binding(
-                    get: { engine.lowPowerModeEnabled },
+            }
+
+            Section {
+                Toggle("低电量模式", isOn: Binding(
+                    get: { engine.lowPowerModeSwitchValue },
                     set: { engine.setLowPowerMode($0) }))
-                    .help("切换 macOS 低电量模式；定时任务也可以自动切换")
+                Toggle("自动低电量模式", isOn: $engine.automaticLowPowerMode)
+                if engine.automaticLowPowerMode {
+                    let thresholdRange = LowPowerModePolicy.thresholdRange
+                    SliderRow(
+                        label: "电量阈值",
+                        value: engine.lowPowerModeThreshold,
+                        unit: "%",
+                        range: Double(thresholdRange.lowerBound)...Double(thresholdRange.upperBound),
+                        step: 1,
+                        showsTickMarks: false,
+                        allowsTextEntry: true
+                    ) {
+                        engine.lowPowerModeThreshold = $0
+                    }
+                }
+                if let error = engine.lowPowerModeError {
+                    Label("无法切换低电量模式：\(error)", systemImage: "exclamationmark.circle")
+                        .foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("节能")
+            } footer: {
+                Text("手动开关立即生效，下次接入电源时恢复自动规则。")
+                if engine.automaticLowPowerMode {
+                    Text("使用电池且电量低于阈值时自动开启，接入电源时关闭。")
+                }
             }
 
             Section("系统集成") {

@@ -32,6 +32,68 @@ func eval(
         chargingOn: chargingOn, config: c)
 }
 
+// MARK: - Automatic Low Power Mode
+
+check("LPM disabled leaves an existing setting alone",
+      LowPowerModePolicy.target(enabled: false, source: .external, batteryPercent: 10, threshold: 20) == nil)
+check("LPM starts below the threshold on battery",
+      LowPowerModePolicy.target(enabled: true, source: .battery, batteryPercent: 19, threshold: 20) == true)
+check("LPM at threshold leaves the setting alone",
+      LowPowerModePolicy.target(enabled: true, source: .battery, batteryPercent: 20, threshold: 20) == nil)
+check("LPM above threshold leaves the setting alone",
+      LowPowerModePolicy.target(enabled: true, source: .battery, batteryPercent: 21, threshold: 20) == nil)
+check("LPM turns off when plugged in below threshold",
+      LowPowerModePolicy.target(enabled: true, source: .external, batteryPercent: 19, threshold: 20) == false)
+check("LPM turns off on external power even if charge is unreadable",
+      LowPowerModePolicy.target(enabled: true, source: .external, batteryPercent: nil, threshold: 20) == false)
+check("LPM ignores an unknown power source",
+      LowPowerModePolicy.target(enabled: true, source: nil, batteryPercent: 10, threshold: 20) == nil)
+check("LPM ignores unreadable or invalid battery percentages",
+      LowPowerModePolicy.target(enabled: true, source: .battery, batteryPercent: nil, threshold: 20) == nil
+      && LowPowerModePolicy.target(enabled: true, source: .battery, batteryPercent: -1, threshold: 20) == nil)
+
+var manualLPM = LowPowerModePolicy.ManualSession()
+manualLPM.observe(.battery)
+manualLPM.set(true)
+check("Manual LPM overrides the automatic threshold", manualLPM.target == true)
+manualLPM.observe(nil)
+check("An unknown source does not end manual LPM", manualLPM.target == true)
+manualLPM.set(false)
+manualLPM.observe(.battery)
+check("Manual off overrides automatic LPM for this battery session", manualLPM.target == false)
+manualLPM.observe(.external)
+check("Plugging in clears the manual off override", manualLPM.target == nil)
+manualLPM.set(true)
+manualLPM.observe(.external)
+check("A manual enable on AC lasts until a new plug-in", manualLPM.target == true)
+manualLPM.observe(.battery)
+manualLPM.observe(.external)
+check("Plug-in requests off even when automation is disabled",
+      manualLPM.target == false && manualLPM.needsRestore)
+manualLPM.didWrite(true)
+check("Late enable completion does not cancel the plug-in reset", manualLPM.needsRestore)
+manualLPM.didWrite(false)
+check("Successful plug-in reset returns control to automation", manualLPM.target == nil)
+manualLPM.set(true)
+manualLPM.set(false)
+check("Manual off on AC stays pending until the helper confirms it", manualLPM.needsRestore)
+manualLPM.didWrite(false)
+manualLPM.observe(.battery)
+check("Manual off on AC allows automation on the next unplug", manualLPM.target == nil)
+
+var resumedLPM = LowPowerModePolicy.ManualSession(state: .enabled)
+resumedLPM.observe(nil)
+resumedLPM.observe(.external)
+check("App restart on AC restores a previously enabled manual session", resumedLPM.needsRestore)
+resumedLPM.didWrite(false)
+check("App restart cleanup clears the persisted session", resumedLPM.state == nil)
+
+var resumedBatteryLPM = LowPowerModePolicy.ManualSession(state: .disabledOnBattery)
+resumedBatteryLPM.observe(.battery)
+check("App restart on battery preserves the manual off choice", resumedBatteryLPM.target == false)
+resumedBatteryLPM.observe(.external)
+check("Reconnection clears a persisted manual off choice", resumedBatteryLPM.state == nil)
+
 // MARK: - Sailing
 
 do {
@@ -188,20 +250,62 @@ do {
 }
 
 do {
-    func del(_ ac: Bool, _ key: Bool, _ sys: Int, _ target: Int) -> Bool {
-        SessionRules.systemManagedDelegation(
-            acAttached: ac, chargingKeyAvailable: key,
-            systemChargeLimit: sys, effectiveTargetPercent: target)
+    typealias Mode = SessionRules.ChargeControlMode
+    let native = Mode(nativeLimitSupported: true, independentSwitchAvailable: false)
+    let legacy = Mode(nativeLimitSupported: false, independentSwitchAvailable: true)
+    let monitor = Mode(nativeLimitSupported: false, independentSwitchAvailable: false)
+    check("native mode does not require a readable limit or charging key", native == .systemManaged && !native.controlsCharging)
+    check("native mode takes precedence over an independent switch",
+          Mode(nativeLimitSupported: true, independentSwitchAvailable: true) == native)
+    check("legacy mode controls charging through the independent switch", legacy.controlsCharging)
+    check("no native limit or independent switch means monitoring only", monitor == .monitoringOnly && !monitor.controlsCharging)
+    func recovery(
+        _ mode: Mode, _ enabled: Bool?, _ volts: Double?,
+        ac: Bool = false, battery: Bool = true, awaitingPower: Bool = false
+    ) -> Mode.AdapterRecovery {
+        mode.adapterRecovery(
+            adapterEnabled: enabled, dcInVoltage: volts, externalPower: ac,
+            hasBattery: battery, awaitingPowerConfirmation: awaitingPower)
     }
- // The 26.7.3 shape: no charging key, native limit equals the target.
-    check("delegate: no-key AC exact match", del(true, false, 80, 80) == true)
-    check("delegate: battery never", del(false, false, 80, 80) == false)
-    check("delegate: charging-key machine never", del(true, true, 80, 80) == false)
- // Native limit above the target (its UI floor is 80) would overshoot.
-    check("delegate: limit above target no", del(true, false, 100, 80) == false)
-    check("delegate: target below native floor no", del(true, false, 80, 75) == false)
- // Top-up at an unset native limit: the system fills to 100 anyway.
-    check("delegate: topup at unset limit", del(true, false, 100, 100) == true)
+    check("76% regression: restore cut adapter even without an active system limit", recovery(native, false, 20.48) == .restore)
+    check("known cut is cleared before cable insertion", recovery(native, false, 0) == .probe)
+    check("known cut with missing voltage can be cleared", recovery(native, false, nil) == .probe)
+    check("power-source report can confirm wall power when voltage is missing", recovery(native, false, nil, ac: true) == .restore)
+    check("unreadable switch with negotiated voltage probes", recovery(native, nil, 20.48) == .probe)
+    check("unreadable switch and voltage on a battery Mac probes", recovery(native, nil, nil) == .probe)
+    check("invalid voltage counts as missing", recovery(native, nil, .nan) == .probe)
+    check("no power and no confirmed cut skips recovery", recovery(native, nil, 0) == .none)
+    check("missing telemetry without battery skips an ambiguous probe", recovery(monitor, nil, nil, battery: false) == .none)
+    check("native recovery skips an enabled switch", recovery(native, true, nil) == .none)
+    check("legacy discharge retains adapter ownership", recovery(legacy, false, 20.48) == .none)
+    check("monitoring mode recovers a legacy adapter cut", recovery(monitor, false, 20.48) == .restore)
+    check("enabled switch still probes when power has not returned after a write",
+          recovery(native, true, 20.48, awaitingPower: true) == .probe)
+    check("missing telemetry still probes while waiting for power",
+          recovery(native, true, nil, awaitingPower: true) == .probe)
+    check("confirmation from macOS ends recovery even with missing SMC telemetry",
+          recovery(native, nil, nil, ac: true, awaitingPower: true) == .none)
+    check("unplugging ends recovery once the switch is enabled",
+          recovery(native, true, 0, awaitingPower: true) == .none)
+    check("confirmed external power does not trigger a probe on a healthy start",
+          recovery(native, nil, nil, ac: true) == .none)
+    check("enabled switch on a normal system-managed drain does not start recovery",
+          recovery(native, true, 20.48) == .none)
+}
+
+do {
+    var deadline = HelperReplyDeadline(deadline: 100)
+    check("helper deadline waits without a reply", deadline.resolve(at: 99, receivedReply: false) == nil)
+    check("helper deadline times out at the deadline", deadline.resolve(at: 100, receivedReply: false) == .timedOut)
+    check("helper deadline drops replies after timeout", deadline.resolve(at: 101, receivedReply: true) == nil)
+
+    var retry = HelperReplyDeadline(deadline: 200)
+    check("a retry accepts a timely reply", retry.resolve(at: 199, receivedReply: true) == .reply)
+    check("a successful retry ignores its timer", retry.resolve(at: 200, receivedReply: false) == nil)
+
+    var delayedTimer = HelperReplyDeadline(deadline: 100)
+    check("a late reply cannot win when timeout delivery is delayed",
+          delayedTimer.resolve(at: 101, receivedReply: true) == .timedOut)
 }
 
 do {
