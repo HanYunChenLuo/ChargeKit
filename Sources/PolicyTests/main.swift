@@ -187,6 +187,23 @@ do {
     check("discharge heat-cancel: heat off no", hc(40, false, 35) == false)
 }
 
+do {
+    func del(_ ac: Bool, _ key: Bool, _ sys: Int, _ target: Int) -> Bool {
+        SessionRules.systemManagedDelegation(
+            acAttached: ac, chargingKeyAvailable: key,
+            systemChargeLimit: sys, effectiveTargetPercent: target)
+    }
+ // The 26.7.3 shape: no charging key, native limit equals the target.
+    check("delegate: no-key AC exact match", del(true, false, 80, 80) == true)
+    check("delegate: battery never", del(false, false, 80, 80) == false)
+    check("delegate: charging-key machine never", del(true, true, 80, 80) == false)
+ // Native limit above the target (its UI floor is 80) would overshoot.
+    check("delegate: limit above target no", del(true, false, 100, 80) == false)
+    check("delegate: target below native floor no", del(true, false, 80, 75) == false)
+ // Top-up at an unset native limit: the system fills to 100 anyway.
+    check("delegate: topup at unset limit", del(true, false, 100, 100) == true)
+}
+
 // MARK: - S6: Native charge-limit stall detection
 
 do {
