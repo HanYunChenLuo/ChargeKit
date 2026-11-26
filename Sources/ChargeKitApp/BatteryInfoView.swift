@@ -14,7 +14,6 @@ struct BatteryInfoView: View {
                         dcInPower: telemetry.dcInPower,
                         batteryPower: telemetry.batteryPower,
                         hostPower: telemetry.hostPower)
-                        .frame(height: 108)
                 } else {
                     Label("实时功率暂不可用", systemImage: "bolt.slash")
                         .foregroundStyle(.secondary)
