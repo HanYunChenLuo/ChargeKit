@@ -12,8 +12,11 @@ import IOKit
 //
 // Permissions: reads work unprivileged; writes require root.
 // Some charge-related keys are system-protected and not writable by
-// third-party apps; the usable control keys on current firmware are
-// CHIE (adapter) and bfD0 (firmware limit upper).
+// third-party apps. Measured on 26.7.3 (fw 13822+): the only usable
+// control key is CHIE (adapter); CHTE/CH0C are gone from the key
+// table, every other CH* key is read-only, and the bfF0/bfD0/bfE0
+// firmware-charge-limit keys (batt's "macOS 27-era" model) accept
+// writes but the firmware does not act on them yet.
 
 public enum AppleSMCError: Error, CustomStringConvertible {
     case serviceNotFound
@@ -97,11 +100,13 @@ public final class AppleSMCClient {
         static let keyInfoTypeOffset = 32
         static let resultOffset = 40
         static let subcommandOffset = 42
+        static let data32Offset = 44
         static let payloadOffset = 48
         static let size = 80
 
         static func buffer(key: UInt32, sub: UInt8, dataSize: UInt32 = 0,
-                           dataType: UInt32 = 0, payload: [UInt8] = []) -> [UInt8] {
+                           dataType: UInt32 = 0, data32: UInt32 = 0,
+                           payload: [UInt8] = []) -> [UInt8] {
             var b = [UInt8](repeating: 0, count: size)
             b.replaceSubrange(0..<4, with: withUnsafeBytes(of: key.littleEndian) { Array($0) })
             b.replaceSubrange(keyInfoSizeOffset..<keyInfoSizeOffset+4,
@@ -109,6 +114,8 @@ public final class AppleSMCClient {
             b.replaceSubrange(keyInfoTypeOffset..<keyInfoTypeOffset+4,
                               with: withUnsafeBytes(of: dataType.littleEndian) { Array($0) })
             b[subcommandOffset] = sub
+            b.replaceSubrange(data32Offset..<data32Offset+4,
+                              with: withUnsafeBytes(of: data32.littleEndian) { Array($0) })
             for (i, byte) in payload.enumerated() where i < 32 {
                 b[payloadOffset + i] = byte
             }
@@ -190,17 +197,20 @@ public final class AppleSMCClient {
         }
     }
 
- /// Enumerate keys (subcommand 8): index -> key. Bounded.
+ /// Enumerate keys (subcommand 8): index -> key. The table size comes
+ /// from #KEY; sub-8 carries the index in data32@44 on the way in and
+ /// returns the key in key@0 (measured on fw 26.7.3: index 0 -> #KEY,
+ /// 1 -> AC-B; data32@44 in the reply stays zero).
     public func allKeys(limit: Int = 10_000) throws -> [SMCKey] {
+        let total = min(Int(try readNumeric(SMCKey("#KEY"))), limit)
         var keys: [SMCKey] = []
-        keys.reserveCapacity(1024)
-        let index: UInt32 = 0
-        while Int(index) < limit {
-            let out = try call(Wire.buffer(key: 0, sub: 8, dataType: 0))
- // data32 carries the index for sub 8 — reuse payload area of keyInfo? No:
- // old ABI puts index in data32@44.
-            _ = out
-            break  // sub-8 wire details need data32 support; enumerate later if needed
+        keys.reserveCapacity(total)
+        for index in 0..<total {
+            let out = try call(Wire.buffer(key: 0, sub: 8, data32: UInt32(index)))
+            guard out[Wire.resultOffset] == 0 else {
+                throw AppleSMCError.smcResult(out[Wire.resultOffset], key: "key index \(index)")
+            }
+            keys.append(SMCKey(rawValue: Wire.u32(out, 0)))
         }
         return keys
     }

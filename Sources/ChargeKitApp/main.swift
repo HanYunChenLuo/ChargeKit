@@ -54,6 +54,7 @@ extension ChargePhase {
         case .holding: return "battery.75"
         case .heatPaused: return "thermometer.high"
         case .discharging: return "arrow.down.circle.fill"
+        case .systemManaged: return "apple.logo"
         }
     }
 
@@ -65,6 +66,7 @@ extension ChargePhase {
         case .holding: return .systemOrange
         case .heatPaused: return .systemRed
         case .discharging: return .systemBlue
+        case .systemManaged: return .systemGreen
         }
     }
 
@@ -1643,6 +1645,32 @@ final class ChargeEngine: ObservableObject {
             config.sailBufferPercent = 1
         }
 
+ // System delegation (26.7.3 firmware): with no user-writable
+ // charging-switch keys the engine cannot stop charging without
+ // cutting the adapter. When the macOS native charge limit equals the
+ // effective target, delegate to it instead: the native limit holds
+ // the battery at the target with wall power staying connected, which
+ // the adapter-cut fallback cannot do. The engine only keeps the
+ // adapter on and writes nothing else. A hot battery keeps the policy
+ // path (heat pause needs the adapter cut executable).
+        let systemManaged = limitingEnabled
+            && SessionRules.systemManagedDelegation(
+                acAttached: acAttached,
+                chargingKeyAvailable: controller.chargingKey != nil,
+                systemChargeLimit: sysLimit,
+                effectiveTargetPercent: config.targetPercent)
+            && !SessionRules.heatThresholdExceeded(
+                batteryTemp: temp,
+                heatProtectionEnabled: config.heatProtectionEnabled,
+                heatThresholdC: config.heatThresholdC)
+        if systemManaged, !adapterOn {
+            HelperClient.shared.setAdapter(enabled: true) { [weak self] error in
+                DispatchQueue.main.async {
+                    self?.helperError = error.map { "\($0.localizedDescription)" }
+                }
+            }
+        }
+
         let decision = policy.evaluate(
             batteryPercent: pct, batteryTemp: temp,
             chargingOn: chargingOn, config: config)
@@ -1691,6 +1719,8 @@ final class ChargeEngine: ObservableObject {
  // session via dischargeActive.
         if !acAttached {
             newSnapshot.phase = .discharging
+        } else if systemManaged {
+            newSnapshot.phase = .systemManaged
         } else if newSnapshot.phase == .charging, newSnapshot.chargePaused {
             newSnapshot.phase = .chargePaused
         }
@@ -1713,6 +1743,14 @@ final class ChargeEngine: ObservableObject {
             recordHistory(.limitReached, "达到充电上限 \(targetPercent)%")
         }
         if newSnapshot.phase != .charging { chargeLegStartPercent = nil }
+
+ // System-delegation edges (who is enforcing the limit right now).
+        if newSnapshot.phase == .systemManaged, prevPhase != .systemManaged {
+            recordHistory(.sessionStarted, "系统限充接管 · 上限 \(config.targetPercent)%")
+        }
+        if prevPhase == .systemManaged, newSnapshot.phase != .systemManaged {
+            recordHistory(.sessionCancelled, "系统限充交还引擎")
+        }
 
  // Heat-pause / release edges (history audit: "why did charging
  // stop/resume?").
@@ -1739,7 +1777,7 @@ final class ChargeEngine: ObservableObject {
 
         prevPhase = newSnapshot.phase
 
-        if decision.chargingOn != chargingOn {
+        if !systemManaged, decision.chargingOn != chargingOn {
             let wanted = decision.chargingOn
             HelperClient.shared.setCharging(enabled: wanted) { [weak self] error in
                 DispatchQueue.main.async {
@@ -1902,6 +1940,8 @@ struct PopoverView: View {
             }
  // 放电会话的进度语义是"到目标电量"，混入"到空"的续航会误导。
             return "电池放电中 · 未接电源" + runtimeSuffix
+        case .systemManaged:
+            return "macOS 系统限充管理中 → \(engine.targetPercent)%"
         }
     }
 

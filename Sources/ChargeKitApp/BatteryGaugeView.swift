@@ -37,6 +37,7 @@ struct BatteryGaugeView: View {
         case .holding: return .orange
         case .heatPaused: return .red
         case .discharging: return .blue
+        case .systemManaged: return .green
         }
     }
 

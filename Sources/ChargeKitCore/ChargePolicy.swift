@@ -58,6 +58,14 @@ public enum ChargePhase: Equatable {
  /// machine simply runs on battery. Never returned by ChargePolicy; the
  /// engine sets it — statusText distinguishes the two by dischargeActive.
     case discharging
+ /// Firmware without user-writable charging-switch keys (measured
+ /// 26.7.3: every CH* key except the CHIE adapter key is read-only, and
+ /// the bfF0/bfD0/bfE0 firmware-limit keys store values but the
+ /// firmware does not act on them). Charging control is delegated to
+ /// the macOS native charge limit, which holds the battery at the
+ /// target with wall power staying connected. Never returned by
+ /// ChargePolicy; the engine sets it from the delegation rule.
+    case systemManaged
 }
 
 public struct ChargeDecision: Equatable {
@@ -144,8 +152,40 @@ public enum SessionRules {
     public static func heatCancelsDischarge(
         batteryTemp: Double?, heatProtectionEnabled: Bool, heatThresholdC: Double
     ) -> Bool {
+        heatThresholdExceeded(
+            batteryTemp: batteryTemp,
+            heatProtectionEnabled: heatProtectionEnabled,
+            heatThresholdC: heatThresholdC)
+    }
+
+ /// True when the battery is at/above the heat-pause threshold and the
+ /// reading is usable. Shared by the policy's heat layer, the discharge
+ /// cancel rule, and the system-delegation gate (heat pause must stay
+ /// executable — it outranks delegation).
+    public static func heatThresholdExceeded(
+        batteryTemp: Double?, heatProtectionEnabled: Bool, heatThresholdC: Double
+    ) -> Bool {
         guard heatProtectionEnabled, let temp = batteryTemp, temp.isFinite else { return false }
         return temp >= heatThresholdC
+    }
+
+ /// Delegate charge limiting to the macOS native charge limit on
+ /// firmware without user-writable charging-switch keys. The native
+ /// limit holds the battery AT the target with the adapter still
+ /// powering the machine — strictly better than the adapter-cut
+ /// fallback, which drains the battery down to the sailing bottom each
+ /// cycle. Only exact matches qualify: with the native limit above the
+ /// target (its UI floor is 80%) the battery would overshoot, and heat
+ /// protection needs the adapter cut executable, so neither may
+ /// delegate. Measured on 26.7.3: CHTE/CH0C are gone from the key
+ /// table and every remaining CH* key except CHIE is read-only.
+    public static func systemManagedDelegation(
+        acAttached: Bool,
+        chargingKeyAvailable: Bool,
+        systemChargeLimit: Int,
+        effectiveTargetPercent: Int
+    ) -> Bool {
+        acAttached && !chargingKeyAvailable && systemChargeLimit == effectiveTargetPercent
     }
 
  // MARK: S7: sleep / auto-discharge predicates

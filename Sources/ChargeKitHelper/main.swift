@@ -244,7 +244,7 @@ final class HelperService: NSObject, HelperProtocol {
     }
 
     func version(withReply reply: @escaping (String) -> Void) {
-        reply("0.5.6")
+        reply("0.5.7")
     }
 
     func adapterState(withReply reply: @escaping (Bool, Error?) -> Void) {
@@ -375,7 +375,17 @@ func restoreState() {
     DischargeManager.shared.cancel()
     if let client = try? AppleSMCClient() {
         let controller = ChargeController(client: client)
-        if exitRestoresCharging {
+ // Exit preference, except on firmware without a charging-switch key:
+ // there "keep the current charging state" means leaving the adapter
+ // cut, and nothing would ever restore wall power after the app is
+ // gone (measured 26.7.3: every CH* key except CHIE is read-only, so
+ // the adapter cut is the only stop-charging mechanism). Safety rule:
+ // a machine may never be left running on battery unattended.
+        let canKeepChargingOff = controller.chargingKey != nil
+        if exitRestoresCharging || !canKeepChargingOff {
+            if !exitRestoresCharging {
+                NSLog("[ChargeKitHelper] exit-keeps-charging ignored: no charging-switch key, restoring adapter")
+            }
  // Charging switch: leaving it off stops the battery at its current
  // level while the adapter keeps powering the machine — safe, but
  // restore anyway so a dead daemon never pins the state.

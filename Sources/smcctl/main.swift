@@ -19,6 +19,7 @@ smcctl — AppleSMC user client CLI
 USAGE:
   smcctl smc2-read <KEY>            Read via verified ABI (selector 2)
   smcctl smc2-write <KEY> <HEX>     Write via verified ABI (root; charge keys)
+  smcctl enumerate [PREFIX]         List SMC keys (sub-8); optional prefix filter
   smcctl helper-test                XPC round-trip (version + adapter state)
   smcctl helper-adapter <on|off>    Adapter control via XPC
   smcctl helper-discharge <cmd>     Discharge session: on <floor> | off | state
@@ -206,6 +207,69 @@ func run() -> Int32 {
             }
             _ = sem.wait(timeout: .now() + 10)
             conn.invalidate()
+        case "probe8":
+            // Raw sub-8 probe: dump the full 80-byte reply for one key index.
+            guard let idx = Int(rest.first ?? "") else { print("probe8 <INDEX>"); return 64 }
+            let cli = try client()
+            var b = [UInt8](repeating: 0, count: 80)
+            b[42] = 8
+            b.replaceSubrange(44..<48, with: withUnsafeBytes(of: UInt32(idx).littleEndian) { Array($0) })
+            let (kr, out) = cli.rawStructCall(selector: 2, input: b)
+            print(String(format: "kr=0x%08x result=%d status=%d", kr, out[40], out[41]))
+            print(out.map { String(format: "%02x", $0) }.joined(separator: " "))
+        case "probe-writable":
+            // Write each key's CURRENT value back to it: zero semantic
+            // change, but distinguishes writable control keys from
+            // read-only telemetry. Run as root.
+            guard !rest.isEmpty else { print("probe-writable <KEY>..."); return 64 }
+            let cli = try client()
+            for n in rest where n.count == 4 {
+                let key = SMCKey(n)
+                guard let info = try? cli.keyInfo(key),
+                      info.dataSize > 0, info.dataSize <= 32,
+                      let v = try? cli.read(key) else {
+                    print("\(n): no-key"); continue
+                }
+                do {
+                    try cli.write(key, v)
+                    print("\(n): WRITABLE")
+                } catch AppleSMCError.smcResult(let r, _) {
+                    print("\(n): RO result=\(r)")
+                } catch {
+                    print("\(n): error \(error)")
+                }
+            }
+        case "snapshot":
+            // Read many keys in one process; prints "KEY = 0x.." lines,
+            // one per readable key, for state diffing. No args = all CH* keys.
+            let cli = try client()
+            let names: [String]
+            if rest.isEmpty {
+                names = try cli.allKeys().map(\.fourCC).filter { $0.hasPrefix("CH") }
+            } else {
+                names = rest
+            }
+            for n in names where n.count == 4 {
+                guard let info = try? cli.keyInfo(SMCKey(n)),
+                      info.dataSize > 0, info.dataSize <= 32 else {
+                    print("\(n) = <unreadable>"); continue
+                }
+                guard let v = try? cli.read(SMCKey(n)) else {
+                    print("\(n) = <unreadable>"); continue
+                }
+                print("\(n) = 0x" + v.map { String(format: "%02x", $0) }.joined())
+            }
+        case "enumerate":
+            // Enumerate the SMC key table via sub-8 (key-from-index).
+            // Optional argument: key-name prefix filter (e.g. CH).
+            let cli = try client()
+            let keys = try cli.allKeys()
+            let prefix = rest.first?.uppercased()
+            let matched = keys.filter { prefix == nil || $0.fourCC.hasPrefix(prefix!) }
+            for k in matched {
+                print(k.fourCC)
+            }
+            print("(\(matched.count)/\(keys.count) keys)")
         case "smc2-write":
             // Write via gosmc ABI: smc2-write <KEY> <HEXBYTES e.g. 01>
             guard rest.count >= 2, let bytes = hexBytes(rest[1]), !bytes.isEmpty, bytes.count <= 32 else {
