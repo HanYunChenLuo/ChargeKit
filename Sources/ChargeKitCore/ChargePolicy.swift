@@ -467,6 +467,7 @@ public struct CalibrationSession {
         batteryPercent pct: Double,
         acAttached: Bool,
         dischargeActive: Bool,
+        dischargeResult: DischargePhase? = nil,
         now: Date,
         config: CalibrationConfig
     ) -> Event? {
@@ -486,6 +487,10 @@ public struct CalibrationSession {
             dischargeStartedAt = now
             return .beginDischarge
         case .discharging:
+            if let result = dischargeResult?.result {
+                finished = true
+                return result == .reachedFloor ? .completed : .aborted
+            }
  // The daemon owns this leg: floor enforcement, re-asserted cut,
  // fail-safe restore. AC loss is fine — the battery is the power
  // source either way.
@@ -494,17 +499,15 @@ public struct CalibrationSession {
                 legConfirmedActive = true
                 return nil
             }
- // Mirror reads inactive. Only an inactive reading from a SYNCED
- // mirror (active seen this run) completes the leg at once; a
- // fresh/resumed run stays quiet through the grace window first.
+            // A disappeared session has no confirmed outcome.
             if sawDischargeActive {
                 finished = true
-                return .completed
+                return .aborted
             }
             guard let started = dischargeStartedAt,
                   now.timeIntervalSince(started) <= 15 else {
                 finished = true
-                return legConfirmedActive ? .completed : .aborted
+                return .aborted
             }
             return nil  // grace window: XPC/poll lag, or post-resume sync
         }

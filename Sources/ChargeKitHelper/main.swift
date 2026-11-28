@@ -1,17 +1,19 @@
 import Foundation
 import SMCKit
+import ChargeKitCore
+import ChargeKitIPC
 import IOKit.pwr_mgt
 import IOKit.ps
 
 // ChargeKitHelper — root LaunchDaemon owning privileged SMC writes.
 // MachService: com.chargekit.helper
-// Safety: any exit path (SIGTERM/SIGINT) restores the adapter to ON before dying,
-// so the machine can never be left on battery indefinitely.
+// An active discharge records adapter recovery before cutting wall power.
 
 let machServiceName = "com.chargekit.helper"
 let adapterKey = ChargeController.AdapterKey(rawValue: "CHIE")!
 let installedHelperBinary = "/Library/PrivilegedHelperTools/\(machServiceName)"
 let installedHelperPlist = "/Library/LaunchDaemons/\(machServiceName).plist"
+let adapterRecoveryMarker = URL(fileURLWithPath: "/var/db/com.chargekit.helper.adapter-recovery")
 
 var chargeKitAppPaths: [String] = {
     var paths = ["/Applications/ChargeKit.app"]
@@ -31,20 +33,6 @@ func chargeKitAppIsInstalled() -> Bool {
     }
 }
 
-@objc public protocol HelperProtocol {
-    func version(withReply reply: @escaping (String) -> Void)
-    func adapterState(withReply reply: @escaping (Bool, Error?) -> Void)
-    func setAdapter(enabled: Bool, withReply reply: @escaping (Error?) -> Void)
-    func chargingState(withReply reply: @escaping (Bool, Error?) -> Void)
-    func setCharging(enabled: Bool, withReply reply: @escaping (Error?) -> Void)
-    func setDischarge(enabled: Bool, floorPercent: Int, hardwarePercent: Bool, withReply reply: @escaping (Error?) -> Void)
-    func dischargeState(withReply reply: @escaping (Bool, Int, Error?) -> Void)
-    func readKey(_ key: String, withReply reply: @escaping (Data?, Error?) -> Void)
-    func writeKey(_ key: String, value: Data, withReply reply: @escaping (Error?) -> Void)
-    func setLowPowerMode(enabled: Bool, withReply reply: @escaping (Error?) -> Void)
-    func setExitRestoresCharging(enabled: Bool, withReply reply: @escaping (Error?) -> Void)
-}
-
 func domainError(_ message: String) -> NSError {
     NSError(domain: "com.chargekit.helper", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
 }
@@ -53,19 +41,22 @@ func domainError(_ message: String) -> NSError {
 /// battery (a UPS would otherwise feed the discharge floor with its own
 /// wall-backed 100% — review round 2, P2-1). nil when IOPS is unreadable
 /// or has no internal battery; callers fall back to the BMS percent.
-func macOSBatteryPercent() -> Int? {
+func internalBatteryDescription() -> [String: Any]? {
     guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
           let list = IOPSCopyPowerSourcesList(info)?.takeRetainedValue() as? [CFTypeRef],
           !list.isEmpty else { return nil }
     for source in list {
         guard let desc = IOPSGetPowerSourceDescription(info, source)?
             .takeUnretainedValue() as? [String: Any] else { continue }
-        if (desc[kIOPSTypeKey as String] as? String) == "InternalBattery",
-           let capacity = desc[kIOPSCurrentCapacityKey as String] as? Int {
-            return capacity
+        if (desc[kIOPSTypeKey as String] as? String) == "InternalBattery" {
+            return desc
         }
     }
     return nil
+}
+
+func macOSBatteryPercent() -> Int? {
+    internalBatteryDescription()?[kIOPSCurrentCapacityKey as String] as? Int
 }
 
 // MARK: - Discharge session (daemon-owned)
@@ -118,6 +109,9 @@ final class DischargeManager {
     static let shared = DischargeManager()
 
     private(set) var floorPercent: Int?
+    private(set) var sessionID: String?
+    private(set) var phase: DischargePhase = .idle
+    private var resultAfterRestore: DischargePhase = .failed
  /// Battery-percent basis for the floor comparison, matching the app's
  /// "hardware battery percentage" toggle at session start.
     private var useHardwarePercent = true
@@ -128,7 +122,7 @@ final class DischargeManager {
     private let maxReadFailures = 3
     private let sleepGuard = DischargeSleepGuard()
 
-    var active: Bool { floorPercent != nil }
+    var active: Bool { phase.ownsAdapter }
 
  /// All state is touched on the main queue only (XPC handlers and the
  /// timer both run there), so no locking is needed.
@@ -152,6 +146,7 @@ final class DischargeManager {
     }
 
     func start(floorPercent floor: Int, hardwarePercent: Bool) throws {
+        guard !active else { throw domainError("放电或供电恢复仍在进行") }
         let clamped = min(max(floor, 5), 95)
         let c = try controller()
  // Pre-check on the INCOMING basis; useHardwarePercent is committed
@@ -160,51 +155,90 @@ final class DischargeManager {
         let pct = try currentPercent(c, useHardware: hardwarePercent)
         guard pct > Double(clamped) else {
             NSLog("[ChargeKitHelper] discharge: battery \(pct) already at/below floor \(clamped)")
-            return
+            throw domainError("电量已达到放电下限")
         }
-        try c.setAdapter(enabled: false)
+        // launchd keeps this job alive while the marker exists, including after a crash.
+        try Data().write(to: adapterRecoveryMarker, options: .atomic)
+        sessionID = UUID().uuidString
         floorPercent = clamped
+        do {
+            try c.setAdapter(enabled: false)
+        } catch {
+            stop(with: .failed)
+            throw error
+        }
+        phase = .discharging
         useHardwarePercent = hardwarePercent
         loggedIOPSFallback = false
         consecutiveReadFailures = 0
         sleepGuard.setPreventSystemSleep(true)
         NSLog("[ChargeKitHelper] discharge: floor=\(clamped) from \(pct)")
+        startTimer()
+    }
+
+    private func startTimer() {
+        guard timer == nil else { return }
         let t = DispatchSource.makeTimerSource(queue: .main)
         t.schedule(deadline: .now() + 2, repeating: 2)
         t.setEventHandler { [weak self] in self?.tick() }
-        timer?.cancel()
         timer = t
         t.resume()
     }
 
     func cancel() {
-        guard floorPercent != nil else { return }
-        stop(restoreAdapter: true)
+        if phase == .discharging { stop(with: .cancelled) }
     }
 
-    private func stop(restoreAdapter: Bool) {
+    func recoverAfterRestart() {
+        guard FileManager.default.fileExists(atPath: adapterRecoveryMarker.path) else { return }
+        stop(with: .failed)
+    }
+
+    private func stop(with result: DischargePhase) {
+        phase = .restoring
+        resultAfterRestore = result
+        startTimer()
+        retryRestore()
+    }
+
+    private func retryRestore() {
+        do {
+            let c = try controller()
+            try c.setAdapter(enabled: true)
+            guard try c.isAdapterEnabled() else { throw domainError("适配器恢复未确认") }
+            if SessionRules.wallAttached(dcInVoltage: try? c.dcInVoltage()) {
+                let source = internalBatteryDescription()?[kIOPSPowerSourceStateKey as String] as? String
+                guard source == kIOPSACPowerValue else { throw domainError("等待 macOS 确认外接供电") }
+            }
+            try FileManager.default.removeItem(at: adapterRecoveryMarker)
+        } catch {
+            NSLog("[ChargeKitHelper] adapter recovery retry: %@", error.localizedDescription)
+            return
+        }
         sleepGuard.setPreventSystemSleep(false)
         timer?.cancel()
         timer = nil
-        floorPercent = nil
-        if restoreAdapter, let c = try? controller() {
-            _ = try? c.setAdapter(enabled: true)
-        }
+        phase = resultAfterRestore
     }
 
     private func tick() {
-        guard floorPercent != nil else { return }
+        if phase == .restoring { retryRestore(); return }
+        guard phase == .discharging, let floorPercent else { return }
         guard let c = try? controller() else { failRead(); return }
-        guard let pct = try? currentPercent(c, useHardware: useHardwarePercent) else { failRead(); return }
+        guard let pct = try? currentPercent(c, useHardware: useHardwarePercent), pct.isFinite else {
+            failRead()
+            return
+        }
         consecutiveReadFailures = 0
-        if pct <= Double(floorPercent!) {
-            NSLog("[ChargeKitHelper] discharge: floor \(floorPercent!) reached at \(pct), restoring adapter")
-            stop(restoreAdapter: true)
+        if pct <= Double(floorPercent) {
+            NSLog("[ChargeKitHelper] discharge: floor \(floorPercent) reached at \(pct), restoring adapter")
+            stop(with: .reachedFloor)
             return
         }
  // Re-assert the cut: covers an adapter re-plug or an external write
  // that re-enabled it mid-session.
-        _ = try? c.setAdapter(enabled: false)
+        do { try c.setAdapter(enabled: false) }
+        catch { stop(with: .failed) }
     }
 
     private func failRead() {
@@ -212,7 +246,7 @@ final class DischargeManager {
         NSLog("[ChargeKitHelper] discharge: read failure \(consecutiveReadFailures)/\(maxReadFailures)")
         if consecutiveReadFailures >= maxReadFailures {
             NSLog("[ChargeKitHelper] discharge: reads failing, fail-safe restore")
-            stop(restoreAdapter: true)
+            stop(with: .failed)
         }
     }
 }
@@ -220,11 +254,16 @@ final class DischargeManager {
 final class HelperDelegate: NSObject, NSXPCListenerDelegate {
     func listener(_ listener: NSXPCListener,
                   shouldAcceptNewConnection newConnection: NSXPCConnection) -> Bool {
- // Basic PID sanity check.
-        // TODO: implement audit-token + code-signing verification.
-        // multi-user environments (see README Security notes).
         let pid = newConnection.processIdentifier
         guard pid > 0 else { return false }
+        if newConnection.effectiveUserIdentifier != 0 {
+            guard let hash = ProcessInfo.processInfo.environment["CHARGEKIT_CLIENT_CDHASH"],
+                  hash.utf8.count == 40,
+                  hash.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
+                return false
+            }
+            newConnection.setCodeSigningRequirement("cdhash H\"\(hash)\"")
+        }
         NSLog("[ChargeKitHelper] client pid=\(pid) accepted")
 
         let interface = NSXPCInterface(with: HelperProtocol.self)
@@ -236,20 +275,15 @@ final class HelperDelegate: NSObject, NSXPCListenerDelegate {
 }
 
 final class HelperService: NSObject, HelperProtocol {
-    private var smc: AppleSMCClient
-
-    override init() {
-        self.smc = (try? AppleSMCClient()) ?? (try! AppleSMCClient())
-        super.init()
-    }
+    private static let powerModeQueue = DispatchQueue(label: "com.chargekit.helper.low-power-mode")
 
     func version(withReply reply: @escaping (String) -> Void) {
-        reply("0.5.7")
+        reply("0.5.9")
     }
 
     func adapterState(withReply reply: @escaping (Bool, Error?) -> Void) {
         do {
-            let enabled = try ChargeController(client: smc).isAdapterEnabled()
+            let enabled = try ChargeController(client: AppleSMCClient()).isAdapterEnabled()
             reply(enabled, nil)
         } catch {
             reply(false, error as NSError)
@@ -257,17 +291,23 @@ final class HelperService: NSObject, HelperProtocol {
     }
 
     func setAdapter(enabled: Bool, withReply reply: @escaping (Error?) -> Void) {
-        do {
-            try ChargeController(client: smc).setAdapter(enabled: enabled)
-            reply(nil)
-        } catch {
-            reply(error as NSError)
+        DispatchQueue.main.async {
+            do {
+                guard enabled else { throw domainError("请使用带电量下限的放电会话") }
+                guard !DischargeManager.shared.active else { throw domainError("放电会话持有适配器") }
+                let controller = try ChargeController(client: AppleSMCClient())
+                try controller.setAdapter(enabled: true)
+                guard try controller.isAdapterEnabled() else { throw domainError("适配器恢复未确认") }
+                reply(nil)
+            } catch {
+                reply(error as NSError)
+            }
         }
     }
 
     func chargingState(withReply reply: @escaping (Bool, Error?) -> Void) {
         do {
-            let enabled = try ChargeController(client: smc).isChargingEnabled()
+            let enabled = try ChargeController(client: AppleSMCClient()).isChargingEnabled()
             reply(enabled, nil)
         } catch {
             reply(false, error as NSError)
@@ -275,48 +315,65 @@ final class HelperService: NSObject, HelperProtocol {
     }
 
     func setCharging(enabled: Bool, withReply reply: @escaping (Error?) -> Void) {
-        do {
-            try ChargeController(client: smc).setCharging(enabled: enabled)
-            reply(nil)
-        } catch {
-            reply(error as NSError)
+        DispatchQueue.main.async {
+            do {
+                let controller = try ChargeController(client: AppleSMCClient())
+                guard controller.chargingKey != nil else { throw domainError("缺少独立充电开关") }
+                try controller.setCharging(enabled: enabled)
+                guard try controller.isChargingEnabled() == enabled else {
+                    throw domainError("充电开关写入未确认")
+                }
+                reply(nil)
+            } catch {
+                reply(error as NSError)
+            }
         }
     }
 
     func setDischarge(enabled: Bool, floorPercent: Int, hardwarePercent: Bool, withReply reply: @escaping (Error?) -> Void) {
-        do {
-            if enabled {
-                try DischargeManager.shared.start(floorPercent: floorPercent, hardwarePercent: hardwarePercent)
-            } else {
-                DischargeManager.shared.cancel()
+        DispatchQueue.main.async {
+            do {
+                if enabled {
+                    try DischargeManager.shared.start(floorPercent: floorPercent, hardwarePercent: hardwarePercent)
+                } else {
+                    DischargeManager.shared.cancel()
+                }
+                reply(nil)
+            } catch {
+                reply(error as NSError)
             }
-            reply(nil)
-        } catch {
-            reply(error as NSError)
         }
     }
 
     func dischargeState(withReply reply: @escaping (Bool, Int, Error?) -> Void) {
-        reply(DischargeManager.shared.active, DischargeManager.shared.floorPercent ?? 0, nil)
+        DispatchQueue.main.async {
+            let manager = DischargeManager.shared
+            reply(manager.active, manager.active ? manager.floorPercent ?? 0 : 0, nil)
+        }
+    }
+
+    func dischargeStatus(withReply reply: @escaping (Int, Int, String?) -> Void) {
+        DispatchQueue.main.async {
+            let manager = DischargeManager.shared
+            reply(manager.phase.rawValue, manager.floorPercent ?? 0, manager.sessionID)
+        }
     }
 
     func readKey(_ key: String, withReply reply: @escaping (Data?, Error?) -> Void) {
-        guard key.count == 4 else { reply(nil, domainError("bad key")); return }
+        guard key == "ACLC" else { reply(nil, domainError("key not allowed")); return }
         do {
-            reply(Data(try smc.read(SMCKey(key))), nil)
+            reply(Data(try AppleSMCClient().read(SMCKey(key))), nil)
         } catch {
             reply(nil, error as NSError)
         }
     }
 
     func writeKey(_ key: String, value: Data, withReply reply: @escaping (Error?) -> Void) {
- // Whitelist: charge-control keys plus MagSafe LED color (ACLC).
-        let allowed: Set<String> = ["CHIE", "CH0I", "CH0J", "bfD0", "CHTE", "CH0B", "CH0C", "BCLM", "ACLC"]
-        guard allowed.contains(key) else {
+        guard key == "ACLC", value.count == 1 else {
             reply(domainError("key \(key) not whitelisted")); return
         }
         do {
-            try smc.write(SMCKey(key), [UInt8](value))
+            try AppleSMCClient().write(SMCKey(key), [UInt8](value))
             reply(nil)
         } catch {
             reply(error as NSError)
@@ -330,7 +387,7 @@ final class HelperService: NSObject, HelperProtocol {
  // argv, no shell, no user-controlled text. Runs off the main queue:
  // XPC handlers and the DischargeManager timer share it, and a hung
  // pmset must not stall discharge floor checks.
-        DispatchQueue.global().async {
+        Self.powerModeQueue.async {
             let pmset = "/usr/bin/pmset"
             guard FileManager.default.isExecutableFile(atPath: pmset) else {
                 reply(domainError("pmset not found")); return
@@ -356,8 +413,10 @@ final class HelperService: NSObject, HelperProtocol {
     }
 
     func setExitRestoresCharging(enabled: Bool, withReply reply: @escaping (Error?) -> Void) {
-        exitRestoresCharging = enabled
-        reply(nil)
+        DispatchQueue.main.async {
+            exitRestoresCharging = enabled
+            reply(nil)
+        }
     }
 }
 
@@ -413,7 +472,8 @@ func deleteInstalledHelperFiles() {
 /// launchd to boot the service out; the SIGTERM handler finishes the
 /// file cleanup before the process dies.
 func uninstallSelfIfAppMissing() {
-    guard !uninstallingSelf, !chargeKitAppIsInstalled() else { return }
+    guard !uninstallingSelf, !chargeKitAppIsInstalled(),
+          !DischargeManager.shared.active else { return }
     NSLog("[ChargeKitHelper] ChargeKit.app missing — uninstalling helper")
     uninstallingSelf = true
     restoreState()
@@ -423,11 +483,12 @@ func uninstallSelfIfAppMissing() {
     p.arguments = ["bootout", "system/\(machServiceName)"]
     p.standardOutput = FileHandle.nullDevice
     p.standardError = FileHandle.nullDevice
-    try? p.run()
+    do { try p.run() }
+    catch { uninstallingSelf = false }
 }
 
 // signal handlers must be re-entrant; use DispatchSource
-for sig in [SIGTERM, SIGINT, SIGHUP] {
+let signalSources = [SIGTERM, SIGINT, SIGHUP].map { sig in
     signal(sig, SIG_IGN)
     let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
     src.setEventHandler {
@@ -439,12 +500,14 @@ for sig in [SIGTERM, SIGINT, SIGHUP] {
         restoreAndExit(0)
     }
     src.resume()
+    return src
 }
 
 // MARK: - Run
 
 let delegate = HelperDelegate()
 let listener = NSXPCListener(machServiceName: machServiceName)
+DischargeManager.shared.recoverAfterRestart()
 listener.delegate = delegate
 listener.resume()
 NSLog("[ChargeKitHelper] listening on \(machServiceName)")
@@ -453,13 +516,7 @@ NSLog("[ChargeKitHelper] listening on \(machServiceName)")
 DispatchQueue.global().async {
     while true {
         Thread.sleep(forTimeInterval: 60)
-        if !chargeKitAppIsInstalled() {
-            uninstallSelfIfAppMissing()
-            if uninstallingSelf {
-                deleteInstalledHelperFiles()
-                exit(0)
-            }
-        }
+        DispatchQueue.main.async { uninstallSelfIfAppMissing() }
         if let c = try? AppleSMCClient(), (try? ChargeController(client: c).isAdapterEnabled()) != nil {
             continue
         }

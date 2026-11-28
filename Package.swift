@@ -20,21 +20,22 @@ let package = Package(
             path: "Sources/ChargeKitCore",
             swiftSettings: v5
         ),
+        .target(name: "ChargeKitIPC", swiftSettings: v5),
         .executableTarget(
             name: "smcctl",
-            dependencies: ["SMCKit"],
+            dependencies: ["SMCKit", "ChargeKitIPC"],
             path: "Sources/smcctl",
             swiftSettings: v5
         ),
         .executableTarget(
             name: "ChargeKitHelper",
-            dependencies: ["SMCKit"],
+            dependencies: ["SMCKit", "ChargeKitCore", "ChargeKitIPC"],
             path: "Sources/ChargeKitHelper",
             swiftSettings: v5
         ),
         .executableTarget(
             name: "ChargeKitApp",
-            dependencies: ["SMCKit", "ChargeKitCore", .product(name: "Sparkle", package: "Sparkle")],
+            dependencies: ["SMCKit", "ChargeKitCore", "ChargeKitIPC", .product(name: "Sparkle", package: "Sparkle")],
             path: "Sources/ChargeKitApp",
             swiftSettings: v5
         ),
