@@ -27,9 +27,13 @@ struct BatteryGaugeView: View {
  /// #FF9500 at ~35° (bright, red-leaning).
     private static let lowPowerYellow = Color(red: 0.84, green: 0.66, blue: 0)
 
-    private var fill: Double { min(max(percent ?? 0, 0), 100) }
+    private var level: Double? {
+        guard let percent, percent.isFinite else { return nil }
+        return min(max(percent, 0), 100)
+    }
+    private var percentText: String { level.map { "\(Int($0))%" } ?? "—%" }
     private var fillColor: Color {
-        if (percent ?? 100) <= 20 { return .red }
+        if (level ?? 100) <= 20 { return .red }
         if lowPowerMode { return Self.lowPowerYellow }
         switch phase {
         case .charging, .idle: return .green
@@ -42,7 +46,10 @@ struct BatteryGaugeView: View {
     }
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 12) {
+            Text(percentText)
+                .font(.system(size: 36, weight: .semibold, design: .rounded))
+                .monospacedDigit()
             HStack(spacing: 2) {
                 ZStack(alignment: .leading) {
                     Capsule()
@@ -51,7 +58,7 @@ struct BatteryGaugeView: View {
                         .frame(width: gaugeWidth, height: gaugeHeight)
                     Capsule()
                         .fill(fillColor)
-                        .frame(width: gaugeWidth * fill / 100,
+                        .frame(width: (gaugeWidth - 6) * (level ?? 0) / 100,
                                height: gaugeHeight - 6)
                         .padding(.leading, 3)
                 }
@@ -59,12 +66,9 @@ struct BatteryGaugeView: View {
                     .fill(Color.secondary.opacity(0.5))
                     .frame(width: 3.5, height: gaugeHeight * 0.45)
             }
-            Text(percent == nil ? "—%" : "\(Int(fill))%")
-                .font(.system(.title3, design: .rounded))
-                .bold().monospacedDigit()
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(Text("电池电量"))
-        .accessibilityValue(Text(percent == nil ? "无法读取" : "\(Int(fill))%"))
+        .accessibilityValue(Text(level == nil ? "无法读取" : percentText))
     }
 }

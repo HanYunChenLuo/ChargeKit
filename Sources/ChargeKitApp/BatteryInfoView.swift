@@ -4,16 +4,30 @@ import SwiftUI
 /// independently of the live SMC snapshot.
 struct BatteryInfoView: View {
     let info: BatteryInfo
-    let telemetry: ChargeEngine.Snapshot?
+    let snapshot: ChargeEngine.Snapshot
+    let statusText: String
+    let lowPowerMode: Bool
+
+    private var telemetry: ChargeEngine.Snapshot? { snapshot.readError == nil ? snapshot : nil }
 
     var body: some View {
         Form {
+            Section("当前状态") {
+                VStack(alignment: .leading, spacing: 4) {
+                    BatteryGaugeView(
+                        percent: snapshot.hasBatteryPercent ? snapshot.batteryPercent : nil,
+                        phase: snapshot.isDrainingWhileChargeManaged ? .discharging : snapshot.phase,
+                        lowPowerMode: lowPowerMode)
+                    Text(statusText)
+                        .foregroundStyle(.secondary)
+                }
+            }
             Section("电源流向") {
-                if let telemetry {
+                if snapshot.liveAdapterPower != nil || snapshot.liveBatteryPower != nil {
                     PowerFlowView(
-                        dcInPower: telemetry.dcInPower,
-                        batteryPower: telemetry.batteryPower,
-                        hostPower: telemetry.hostPower)
+                        dcInPower: snapshot.liveAdapterPower,
+                        batteryPower: snapshot.liveBatteryPower,
+                        hostPower: snapshot.liveHostPower)
                 } else {
                     Label("实时功率暂不可用", systemImage: "bolt.slash")
                         .foregroundStyle(.secondary)
@@ -21,11 +35,12 @@ struct BatteryInfoView: View {
             }
 
             Section("电池健康") {
-                InfoRow(label: "健康度",
+                InfoRow(label: "系统报告的健康度",
                         value: info.healthPercent.map { "\($0)%" } ?? "—")
                 InfoRow(label: "设计容量",
                         value: info.designCapacitymAh.map { "\($0) mAh" } ?? "—")
-                InfoRow(label: "估算满充容量", value: maxCapacity)
+                InfoRow(label: "硬件满充容量",
+                        value: info.fullChargeCapacitymAh.map { "\($0) mAh" } ?? "—")
                 InfoRow(label: "循环次数",
                         value: info.cycleCount.map { "\($0)" } ?? "—")
                 if let serial = info.serial {
@@ -38,23 +53,19 @@ struct BatteryInfoView: View {
                 InfoRow(label: "电池温度",
                         value: telemetry?.batteryTemp.map { String(format: "%.1f°C", $0) } ?? "—")
                 InfoRow(label: "续航估算", value: runtimeText)
-                InfoRow(label: "输入功率", value: watts(telemetry?.dcInPower))
-                InfoRow(label: "主机负载", value: watts(telemetry?.hostPower))
-                InfoRow(label: "电池电压 / 电流", value: batteryText)
-                InfoRow(label: "适配器协商档位", value: adapterText)
+                InfoRow(label: "适配器输入功率", value: watts(snapshot.liveAdapterPower))
+                InfoRow(label: "估算主机负载", value: watts(snapshot.liveHostPower))
+                InfoRow(label: "电池电压", value: batteryVoltageText)
+                InfoRow(label: "电池电流", value: batteryCurrentText)
+            }
+
+            Section("电源适配器") {
+                InfoRow(label: "适配器协商电压", value: info.adapterVolts.map(voltageText) ?? "—")
+                InfoRow(label: "适配器报告的功率规格", value: info.adapterWatts.map { "\($0) W" } ?? "—")
             }
         }
         .formStyle(.grouped)
         .padding(.horizontal, 12)
-    }
-
- /// Derived full-charge capacity (design × health), marked approximate:
- /// Apple publishes only the rounded health percent.
-    private var maxCapacity: String {
-        guard let design = info.designCapacitymAh,
-              let health = info.healthPercent else { return "—" }
-        let mah = (Double(design) * Double(health) / 100).rounded()
-        return "≈\(Int(mah)) mAh"
     }
 
     private var dualPercent: String {
@@ -67,32 +78,20 @@ struct BatteryInfoView: View {
         return "\(hardware) / \(macos)"
     }
 
- /// The negotiated PD contract (capability tier), not instantaneous
- /// draw — that is the 输入功率 row.
-    private var adapterText: String {
-        switch (info.adapterVolts, info.adapterWatts) {
-        case let (volts?, watts?):
-            return "\(voltageText(volts)) · \(watts) W"
-        case let (volts?, nil):
-            return voltageText(volts)
-        case let (nil, watts?):
-            return "\(watts) W"
-        case (nil, nil):
-            return "—"
-        }
-    }
-
     private func voltageText(_ volts: Double) -> String {
         "\(volts.formatted(.number.precision(.fractionLength(0...2)))) V"
     }
 
-    private var batteryText: String {
-        switch (telemetry?.batteryVolts, telemetry?.batteryAmps) {
-        case let (volts?, amps?):
-            return String(format: "%.2f V · %.2f A", volts, amps)
-        default:
-            return "—"
-        }
+    private var batteryVoltageText: String {
+        guard let volts = telemetry?.batteryVolts, volts.isFinite else { return "—" }
+        return String(format: "%.2f V", volts)
+    }
+
+    private var batteryCurrentText: String {
+        guard let amps = telemetry?.batteryAmps, amps.isFinite else { return "暂不可用" }
+        if amps == 0 { return "0.000 A" }
+        let direction = amps > 0 ? "充电" : "放电"
+        return "\(String(format: "%.3f A", abs(amps))) · \(direction)"
     }
 
  /// Runtime until empty from the engine's EMA-smoothed estimate; "—"
@@ -103,7 +102,7 @@ struct BatteryInfoView: View {
     }
 
     private func watts(_ value: Double?) -> String {
-        value.map { String(format: "%.1f W", $0) } ?? "—"
+        value.flatMap { $0.isFinite ? String(format: "%.1f W", $0) : nil } ?? "—"
     }
 }
 
