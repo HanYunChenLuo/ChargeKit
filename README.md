@@ -5,7 +5,7 @@ A native macOS charge limiter that gives you full control over your MacBook's ch
 ![macOS 13+](https://img.shields.io/badge/macOS-13%2B-blue)
 ![Swift 6](https://img.shields.io/badge/Swift-6-orange)
 ![License: MIT](https://img.shields.io/badge/License-MIT-green)
-![Tests](https://img.shields.io/badge/Tests-222%20passed-brightgreen)
+![Tests](https://img.shields.io/badge/Tests-269%20passed-brightgreen)
 
 ## What it does
 
@@ -74,8 +74,9 @@ All reads are unprivileged; writes go through the root daemon with a whitelist o
    - **macOS 15+**: open the blocked app once from
      *System Settings → Privacy & Security → Open Anyway*
    - **macOS 13/14**: right-click the app → **Open** → **Open**
-4. On first launch, approve the administrator prompt once to install
-   the privileged helper (required for SMC charge control)
+4. Battery monitoring and macOS-managed charging work without the
+   privileged helper. macOS asks for administrator approval when ChargeKit
+   first needs to perform a privileged operation.
 
 After the first launch, updates are delivered automatically through
 Sparkle — no further Gatekeeper prompts are needed.
@@ -89,7 +90,7 @@ cd ChargeKit
 # Build everything
 swift build -c release
 
-# Run the test suite (222 assertions)
+# Run the test suite (269 assertions)
 swift run policy-tests
 
 # Build and launch the app
@@ -97,9 +98,11 @@ swift run policy-tests
 open build/ChargeKit.app
 ```
 
-The first launch installs the privileged helper from inside the app
-bundle (one-time administrator prompt). A manual fallback is still
-available:
+ChargeKit installs and connects to the bundled helper on demand for
+software charging control, Low Power Mode writes, MagSafe LED writes,
+or adapter recovery when a previous cut is detected. The native-limit
+version split is Apple silicon on macOS 26.4 or later, as implemented
+starting in ChargeKit v0.6.1. A manual install is also available:
 
 ```bash
 sudo ./scripts/install-helper.sh
@@ -133,14 +136,19 @@ sudo ./scripts/uninstall-helper.sh
 
 - **ChargeKitCore** — pure decision logic (heat > limit-toggle > sailing), fully unit-tested
 - **SMCKit** — AppleSMC IOKit client, verified ABI (selector 2 + selector-5 read)
-- **ChargeKitHelper** — root daemon owning privileged writes; crash-safe (all exit paths restore state)
+- **ChargeKitHelper** — root daemon owning privileged writes and adapter recovery
 - **ChargeKitApp** — SwiftUI menu-bar popover + settings window; no privileged code
 
 ## Security notes
 
-- SMC writes are whitelisted to charge-control keys (`CHTE`, `CHIE`, `BCLM`, etc.)
-- The helper daemon restores charging + adapter on every exit path (SIGTERM, crash, uninstall)
-- The XPC connection currently validates PID only (no code-signing verification) — suitable for single-user machines; audit-token verification is planned for multi-user environments
+- XPC exposes typed charging and discharge controls. Raw writes are limited to
+  the MagSafe LED key (`ACLC`).
+- Before a discharge cuts adapter input, the helper records the recovery
+  obligation in `/var/db`. `launchd` can relaunch it while the record exists,
+  and the helper keeps retrying until it reads back the enabled adapter state.
+- Non-root XPC clients must match the app signing hash recorded by the
+  administrator-approved installer. The first privileged operation after an
+  app rebuild or update can require approval to refresh that hash.
 - Update signing (Sparkle EdDSA) private key is kept in three places: the
   `SPARKLE_PRIVATE_KEY` GitHub Secret (release builds), the local login
   keychain, and `secrets/sparkle-private-key.b64` (git-ignored). If the
@@ -154,9 +162,9 @@ sudo ./scripts/uninstall-helper.sh
 ```bash
 .build/release/smcctl smc2-read BUIC        # Read battery percent
 .build/release/smcctl smc2-read PDTR        # Read input power
-.build/release/smcctl helper-test           # XPC round-trip
-.build/release/smcctl helper-adapter on     # Enable adapter
-.build/release/smcctl helper-discharge on 75 hw  # Start discharge
+sudo .build/release/smcctl helper-test           # XPC round-trip
+sudo .build/release/smcctl helper-adapter on     # Enable adapter
+sudo .build/release/smcctl helper-discharge on 75 hw  # Start discharge
 .build/release/smcctl enumerate CH          # List SMC keys (sub-8)
 .build/release/smcctl snapshot              # Dump all CH* key values
 sudo .build/release/smcctl probe-writable CHIE bfD0  # Write-permission probe

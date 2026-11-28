@@ -468,12 +468,13 @@ do {
         _ = step(&s, 100, true, false, t0.addingTimeInterval(600))
         return step(&s, 50, false, true, t0.addingTimeInterval(605)) == nil
     }())
-    check("cal: discharge ends -> completed", {
+    check("cal: confirmed floor and restored adapter -> completed", {
         var s = CalibrationSession()
         _ = step(&s, 99, true, false, t0)
         _ = step(&s, 100, true, false, t0.addingTimeInterval(600))
         _ = step(&s, 50, true, true, t0.addingTimeInterval(605))
-        let e = step(&s, 10, true, false, t0.addingTimeInterval(4000))
+        let e = s.tick(batteryPercent: 10, acAttached: true, dischargeActive: false,
+                       dischargeResult: .reachedFloor, now: t0.addingTimeInterval(4000), config: cfg)
         return e == .completed && s.isFinished
     }())
     check("cal: finished session is inert", {
@@ -487,22 +488,28 @@ do {
         return step(&s, 100, true, false, t0.addingTimeInterval(599)) == nil
             && step(&s, 100, true, false, t0.addingTimeInterval(601)) == .beginDischarge
     }())
-    check("cal: resume in discharge re-anchors grace at resume (real sequence)", {
+    check("cal: resume in discharge waits for sync and aborts on session loss", {
  // fullSince = dwell start; discharge leg began +600 s; app relaunched
  // at +900 s with the daemon session still running. The stale
  // fullSince must NOT expire the grace.
         var s = CalibrationSession(resuming: .discharging, fullSince: t0, now: t0.addingTimeInterval(900))
         return step(&s, 50, true, false, t0.addingTimeInterval(902)) == nil
             && step(&s, 50, true, true, t0.addingTimeInterval(904)) == nil  // mirror synced
-            && step(&s, 50, true, false, t0.addingTimeInterval(906)) == .completed
+            && step(&s, 50, true, false, t0.addingTimeInterval(906)) == .aborted
     }())
-    check("cal: resume with daemon done while app was dead -> completed", {
- // The leg was confirmed active pre-crash (persisted); the daemon
- // finished at the floor during the app's downtime.
+    check("cal: saved activity alone cannot confirm a successful discharge", {
         var s = CalibrationSession(
             resuming: .discharging, fullSince: t0, legConfirmedActive: true, now: t0.addingTimeInterval(900))
         return step(&s, 10, true, false, t0.addingTimeInterval(902)) == nil  // grace
-            && step(&s, 10, true, false, t0.addingTimeInterval(916)) == .completed
+            && step(&s, 10, true, false, t0.addingTimeInterval(916)) == .aborted
+    }())
+    check("cal: adapter recovery retains ownership until a terminal result", {
+        var s = CalibrationSession(resuming: .discharging, fullSince: t0, now: t0)
+        let pending = s.tick(batteryPercent: 10, acAttached: false, dischargeActive: DischargePhase.restoring.ownsAdapter,
+                             now: t0.addingTimeInterval(20), config: cfg)
+        let ended = s.tick(batteryPercent: 10, acAttached: true, dischargeActive: false,
+                           dischargeResult: .failed, now: t0.addingTimeInterval(22), config: cfg)
+        return pending == nil && ended == .aborted
     }())
     check("cal: resume before daemon ever started -> abort after grace", {
         var s = CalibrationSession(resuming: .discharging, fullSince: t0, now: t0)
@@ -714,6 +721,15 @@ do {
     let spent = fired.first!
     check("sched: never next day inert", fireCount(&e, [spent], t(2026, 3, 3, 9, 30)) == 0)
     check("sched: never next week inert", fireCount(&e, [spent], t(2026, 3, 9, 9, 30)) == 0)
+    let occurrence = t(2026, 3, 2, 9, 30)
+    var acknowledged = ScheduleEngine()
+    check("sched: a due rule remains available until acknowledged",
+          acknowledged.pendingRules([once], now: occurrence, calendar: cal).count == 1
+          && acknowledged.lastFiredDay.isEmpty
+          && acknowledged.pendingRules([once], now: occurrence, calendar: cal).count == 1)
+    acknowledged.markFired(once.id, on: occurrence, calendar: cal)
+    check("sched: an acknowledged rule cannot run again today",
+          acknowledged.pendingRules([once], now: occurrence, calendar: cal).isEmpty)
 
  // Fresh rule created after its time never fires retroactively.
     let fresh = rule((9, 0), .daily, createdAt: t(2026, 3, 2, 14, 0))

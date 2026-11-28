@@ -170,6 +170,15 @@ public struct ScheduleEngine {
         calendar: Calendar,
         workdayCalendar: WorkdayCalendar = WorkdayCalendar()
     ) -> [ScheduleRule] {
+        let due = pendingRules(rules, now: now, calendar: calendar, workdayCalendar: workdayCalendar)
+        for rule in due { markFired(rule.id, on: now, calendar: calendar) }
+        return due
+    }
+
+    public func pendingRules(
+        _ rules: [ScheduleRule], now: Date, calendar: Calendar,
+        workdayCalendar: WorkdayCalendar = WorkdayCalendar()
+    ) -> [ScheduleRule] {
         var due: [ScheduleRule] = []
  // Local-day persistence key (stable across time-zone changes).
         let today = Self.localDayKey(for: now, calendar: calendar)
@@ -189,11 +198,14 @@ public struct ScheduleEngine {
                   occurrence >= rule.createdAt,
                   lastFiredDay[rule.id] != today
             else { continue }
-            lastFiredDay[rule.id] = today
             if case .never = rule.repeatMode { rule.enabled = false }
             due.append(rule)
         }
         return due
+    }
+
+    public mutating func markFired(_ id: UUID, on date: Date, calendar: Calendar) {
+        lastFiredDay[id] = Self.localDayKey(for: date, calendar: calendar)
     }
 
  /// Drop bookkeeping for rules that no longer exist.

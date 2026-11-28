@@ -1,16 +1,9 @@
 import Foundation
 
 import SMCKit
+import ChargeKitIPC
 
-@objc protocol HelperXPCProtocol {
-    func version(withReply reply: @escaping (String) -> Void)
-    func adapterState(withReply reply: @escaping (Bool, Error?) -> Void)
-    func setAdapter(enabled: Bool, withReply reply: @escaping (Error?) -> Void)
-    func setDischarge(enabled: Bool, floorPercent: Int, hardwarePercent: Bool, withReply reply: @escaping (Error?) -> Void)
-    func dischargeState(withReply reply: @escaping (Bool, Int, Error?) -> Void)
-    func writeKey(_ key: String, value: Data, withReply reply: @escaping (Error?) -> Void)
-    func setLowPowerMode(enabled: Bool, withReply reply: @escaping (Error?) -> Void)
-}
+typealias HelperXPCProtocol = HelperProtocol
 
 
 let usage = """
@@ -21,7 +14,7 @@ USAGE:
   smcctl smc2-write <KEY> <HEX>     Write via verified ABI (root; charge keys)
   smcctl enumerate [PREFIX]         List SMC keys (sub-8); optional prefix filter
   smcctl helper-test                XPC round-trip (version + adapter state)
-  smcctl helper-adapter <on|off>    Adapter control via XPC
+  smcctl helper-adapter on          Restore adapter power via XPC
   smcctl helper-discharge <cmd>     Discharge session: on <floor> | off | state
   smcctl helper-magsafe <color>     MagSafe LED via XPC: system|off|green|orange|blink-slow|blink-fast|blink-off
   smcctl helper-lpm <on|off>        macOS Low Power Mode via XPC (daemon pmset)
@@ -68,9 +61,8 @@ func run() -> Int32 {
     do {
         switch command {
         case "helper-adapter":
-            // helper-adapter <on|off> — privileged adapter control via XPC.
-            guard let arg = rest.first, arg == "on" || arg == "off" else {
-                print("usage: helper-adapter <on|off>"); return 64
+            guard rest.first == "on" else {
+                print("usage: helper-adapter on"); return 64
             }
             let conn = NSXPCConnection(machServiceName: "com.chargekit.helper", options: [])
             conn.remoteObjectInterface = NSXPCInterface(with: HelperXPCProtocol.self)
@@ -80,11 +72,11 @@ func run() -> Int32 {
                 print("XPC error: \(error.localizedDescription)")
                 sem.signal()
             } as! HelperXPCProtocol
-            proxy.setAdapter(enabled: arg == "on") { error in
+            proxy.setAdapter(enabled: true) { error in
                 if let error {
-                    print("setAdapter(\(arg)) FAILED: \(error.localizedDescription)")
+                    print("setAdapter(on) FAILED: \(error.localizedDescription)")
                 } else {
-                    print("setAdapter(\(arg)) OK")
+                    print("setAdapter(on) OK")
                 }
                 sem.signal()
             }

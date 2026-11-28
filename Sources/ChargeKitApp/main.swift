@@ -5,9 +5,11 @@ import IOKit
 import IOKit.ps
 import IOKit.pwr_mgt
 import ServiceManagement
+import Security
 import UserNotifications
 import SMCKit
 import ChargeKitCore
+import ChargeKitIPC
 import Sparkle
 
 // ChargeKit — macOS menu-bar charge limiter (adapter mode).
@@ -20,22 +22,31 @@ func openSystemBatterySettings() {
 
 // MARK: - Helper XPC client
 
-@objc protocol HelperProtocolObjC {
-    func version(withReply reply: @escaping (String) -> Void)
-    func adapterState(withReply reply: @escaping (Bool, Error?) -> Void)
-    func setAdapter(enabled: Bool, withReply reply: @escaping (Error?) -> Void)
-    func chargingState(withReply reply: @escaping (Bool, Error?) -> Void)
-    func setCharging(enabled: Bool, withReply reply: @escaping (Error?) -> Void)
-    func setDischarge(enabled: Bool, floorPercent: Int, hardwarePercent: Bool, withReply reply: @escaping (Error?) -> Void)
-    func dischargeState(withReply reply: @escaping (Bool, Int, Error?) -> Void)
-    func writeKey(_ key: String, value: Data, withReply reply: @escaping (Error?) -> Void)
-    func setLowPowerMode(enabled: Bool, withReply reply: @escaping (Error?) -> Void)
-    func setExitRestoresCharging(enabled: Bool, withReply reply: @escaping (Error?) -> Void)
-}
+typealias HelperProtocolObjC = HelperProtocol
 
 final class HelperClient {
     static let shared = HelperClient()
     private var connection: NSXPCConnection?
+    func resetConnection() {
+        let previous = connection
+        connection = nil
+        previous?.invalidate()
+    }
+
+    var isConnected: Bool { connection != nil }
+    var exitRestoresCharging = true {
+        didSet {
+            guard oldValue != exitRestoresCharging, let connection else { return }
+            configureExitBehavior(on: connection)
+        }
+    }
+
+    private func configureExitBehavior(on connection: NSXPCConnection) {
+        let proxy = connection.remoteObjectProxyWithErrorHandler { error in
+            NSLog("[ChargeKit] helper configuration: \(error.localizedDescription)")
+        } as? HelperProtocolObjC
+        proxy?.setExitRestoresCharging(enabled: exitRestoresCharging) { _ in }
+    }
 
     private func ensureConnection() -> NSXPCConnection {
         if let c = connection { return c }
@@ -54,6 +65,7 @@ final class HelperClient {
         }
         c.resume()
         connection = c
+        configureExitBehavior(on: c)
         return c
     }
 
@@ -126,29 +138,47 @@ final class HelperClient {
     }
 
     func setCharging(enabled: Bool, completion: @escaping (Error?) -> Void) {
-        proxy?.setCharging(enabled: enabled, withReply: completion)
+        performTimedWrite(completion: completion) { proxy, reply in
+            proxy.setCharging(enabled: enabled, withReply: reply)
+        }
     }
 
  /// Blocking variant for the sleep-entry path: the system freezes right
  /// after willSleep handlers return, so an async fire-and-forget write
  /// can lose the race (measured: cut landed on one sleep, missed on the
  /// next). Bounded at 2 s so a dead daemon never blocks sleep.
-    func setChargingSync(enabled: Bool) {
-        let proxy = ensureConnection().remoteObjectProxyWithErrorHandler { error in
-            NSLog("[ChargeKit] sleep-stop XPC error: \(error.localizedDescription)")
-        } as? HelperProtocolObjC
+    func setChargingSync(enabled: Bool) -> Result<Void, Error> {
         let sem = DispatchSemaphore(value: 0)
-        proxy?.setCharging(enabled: enabled) { _ in sem.signal() }
-        _ = sem.wait(timeout: .now() + 2)
+        let lock = NSLock()
+        var result: Result<Void, Error>?
+        let complete: (Error?) -> Void = { error in
+            lock.lock()
+            if result == nil {
+                result = error.map { .failure($0) } ?? .success(())
+                sem.signal()
+            }
+            lock.unlock()
+        }
+        reportingProxy(complete)?.setCharging(enabled: enabled, withReply: complete)
+        guard sem.wait(timeout: .now() + 2) == .success else {
+            return .failure(NSError(domain: NSPOSIXErrorDomain, code: Int(ETIMEDOUT)))
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        return result ?? .failure(CocoaError(.xpcConnectionInvalid))
     }
 
     func setDischarge(enabled: Bool, floorPercent: Int, hardwarePercent: Bool, completion: @escaping (Error?) -> Void) {
-        reportingProxy(completion)?.setDischarge(
-            enabled: enabled, floorPercent: floorPercent, hardwarePercent: hardwarePercent, withReply: completion)
+        performTimedWrite(completion: completion) { proxy, reply in
+            proxy.setDischarge(
+                enabled: enabled, floorPercent: floorPercent, hardwarePercent: hardwarePercent, withReply: reply)
+        }
     }
 
-    func dischargeState(completion: @escaping (Bool, Int, Error?) -> Void) {
-        proxy?.dischargeState(withReply: completion)
+    func dischargeStatus(completion: @escaping (DischargePhase?, Int, String?, Error?) -> Void) {
+        reportingProxy { completion(nil, 0, nil, $0) }?.dischargeStatus { phase, floor, id in
+            completion(DischargePhase(rawValue: phase), floor, id, nil)
+        }
     }
 
  /// Daemon version (XPC protocol gate): nil when the daemon cannot be
@@ -166,23 +196,11 @@ final class HelperClient {
     }
 
     func setLowPowerMode(_ enabled: Bool, completion: @escaping (Error?) -> Void) {
-        let proxy = ensureConnection().remoteObjectProxyWithErrorHandler {
-            completion($0)
-        } as? HelperProtocolObjC
-        guard let proxy else {
-            completion(CocoaError(.xpcConnectionInvalid))
-            return
+        performTimedWrite(completion: completion) { proxy, reply in
+            proxy.setLowPowerMode(enabled: enabled, withReply: reply)
         }
-        proxy.setLowPowerMode(enabled: enabled, withReply: completion)
     }
 
- /// Exit-behavior preference ("Stop Charging when App Closed"
- /// parity): when false the daemon's exit path keeps the current
- /// charging state instead of restoring. Fire-and-forget — the daemon
- /// defaults to restore (safe) until told otherwise.
-    func setExitRestoresCharging(enabled: Bool, completion: @escaping (Error?) -> Void = { _ in }) {
-        proxy?.setExitRestoresCharging(enabled: enabled, withReply: completion)
-    }
 }
 
 /// One-time privileged helper install from the app bundle. Runs the
@@ -195,17 +213,36 @@ final class HelperInstaller {
     private let helperPath = "/Library/PrivilegedHelperTools/com.chargekit.helper"
     private let daemonPlist = "/Library/LaunchDaemons/com.chargekit.helper.plist"
     private let installerScriptName = "install-helper.sh"
-    private var installInProgress = false
+    private(set) var installInProgress = false
+    private var installWaiters: [(Error?) -> Void] = []
+    private var lastInstallError: Error?
+    private lazy var clientHash: String? = {
+        var code: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(Bundle.main.bundleURL as CFURL, [], &code) == errSecSuccess,
+              let code else { return nil }
+        var information: CFDictionary?
+        guard SecCodeCopySigningInformation(code, SecCSFlags(rawValue: kSecCSSigningInformation), &information)
+                == errSecSuccess,
+              let data = (information as? [String: Any])?[kSecCodeInfoUnique as String] as? Data else { return nil }
+        return data.map { String(format: "%02x", $0) }.joined()
+    }()
+
+    var isInstalled: Bool {
+        let fm = FileManager.default
+        return fm.isExecutableFile(atPath: helperPath) && fm.fileExists(atPath: daemonPlist)
+    }
+
+    func allowRetry() {
+        lastInstallError = nil
+    }
 
     private func error(_ message: String) -> NSError {
         NSError(domain: "com.chargekit.installer", code: 1,
                 userInfo: [NSLocalizedDescriptionKey: message])
     }
 
-    private var needsInstall: Bool {
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: helperPath),
-              fm.fileExists(atPath: daemonPlist),
+    var needsInstall: Bool {
+        guard isInstalled,
               let data = try? Data(contentsOf: URL(fileURLWithPath: daemonPlist)),
               let object = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
               let dict = object as? [String: Any],
@@ -214,22 +251,37 @@ final class HelperInstaller {
               let installedVersion = env["CHARGEKIT_APP_VERSION"] as? String,
               let bundleVersion = Bundle.main.infoDictionary?["CFBundleVersion"] as? String
         else { return true }
+        guard let clientHash else { return true }
         return installedPath != Bundle.main.bundlePath || installedVersion != bundleVersion
+            || env["CHARGEKIT_CLIENT_CDHASH"] as? String != clientHash
     }
 
     func installIfNeeded(completion: @escaping (Error?) -> Void) {
-        guard !installInProgress else { return }
+        guard !installInProgress else {
+            installWaiters.append(completion)
+            return
+        }
         if !needsInstall {
+            lastInstallError = nil
             completion(nil)
+            return
+        }
+        if let lastInstallError {
+            completion(lastInstallError)
             return
         }
         installInProgress = true
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             let result = self.runPrivilegedInstall()
-            self.installInProgress = false
             DispatchQueue.main.async {
+                self.installInProgress = false
+                self.lastInstallError = result
+                if result == nil { HelperClient.shared.resetConnection() }
+                let waiters = self.installWaiters
+                self.installWaiters.removeAll()
                 completion(result)
+                for waiter in waiters { waiter(result) }
             }
         }
     }
@@ -246,7 +298,7 @@ final class HelperInstaller {
         let escaped = script
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
-        let source = "do shell script \"/bin/sh \" & quoted form of \"\(escaped)\" with administrator privileges"
+        let source = "do shell script \"/bin/bash \" & quoted form of \"\(escaped)\" with administrator privileges"
 
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
@@ -706,6 +758,7 @@ final class ChargeEngine: ObservableObject {
     @Published var limitingEnabled: Bool {
         didSet {
             UserDefaults.standard.set(limitingEnabled, forKey: "limitingEnabled")
+            if limitingEnabled && !oldValue { HelperInstaller.shared.allowRetry() }
             recordHistory(.scheduledAction, limitingEnabled ? "开启限制充电" : "关闭限制充电")
         }
     }
@@ -790,7 +843,7 @@ final class ChargeEngine: ObservableObject {
     @Published var exitRestoresCharging: Bool {
         didSet {
             UserDefaults.standard.set(exitRestoresCharging, forKey: "exitRestoresCharging")
-            HelperClient.shared.setExitRestoresCharging(enabled: exitRestoresCharging)
+            HelperClient.shared.exitRestoresCharging = !chargeControlMode.controlsCharging || exitRestoresCharging
         }
     }
  /// Action history (task history parity): most recent first,
@@ -810,6 +863,9 @@ final class ChargeEngine: ObservableObject {
         }
     }
     private var schedule = ScheduleEngine()
+    private var scheduledActionInFlight = false
+    private var scheduledPauseInFlight = false
+    private var scheduleRetryAfter: [UUID: Date] = [:]
     @Published var workdayCalendarRegion: WorkdayCalendarRegion {
         didSet {
             UserDefaults.standard.set(workdayCalendarRegion.rawValue, forKey: "workdayCalendarRegion")
@@ -828,7 +884,10 @@ final class ChargeEngine: ObservableObject {
     @Published private var pendingManualLowPowerMode: Bool?
     @Published private(set) var lowPowerModeError: String?
     @Published var automaticLowPowerMode: Bool {
-        didSet { UserDefaults.standard.set(automaticLowPowerMode, forKey: "automaticLowPowerMode") }
+        didSet {
+            UserDefaults.standard.set(automaticLowPowerMode, forKey: "automaticLowPowerMode")
+            if automaticLowPowerMode && !oldValue { HelperInstaller.shared.allowRetry() }
+        }
     }
     @Published var lowPowerModeThreshold: Int {
         didSet { UserDefaults.standard.set(lowPowerModeThreshold, forKey: "lowPowerModeThreshold") }
@@ -849,6 +908,7 @@ final class ChargeEngine: ObservableObject {
     var lowPowerModeSwitchValue: Bool { pendingManualLowPowerMode ?? lowPowerModeEnabled }
 
     func setLowPowerMode(_ on: Bool) {
+        HelperInstaller.shared.allowRetry()
         let sources = powerSourceSnapshot()
         manualLowPowerMode.observe(lowPowerModeSource(
             internalSource: sources.internalBatterySource, dcInVoltage: readDCInVoltage()))
@@ -889,9 +949,9 @@ final class ChargeEngine: ObservableObject {
         }
     }
 
-    private func writeLowPowerMode(_ on: Bool) {
+    private func writeLowPowerMode(_ on: Bool, completion: ((Bool) -> Void)? = nil) {
         lowPowerModeWriteInFlight = true
-        HelperClient.shared.setLowPowerMode(on) { [weak self] error in
+        let complete: (Error?) -> Void = { [weak self] error in
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.lastLowPowerModeWrite = ProcessInfo.processInfo.systemUptime
@@ -902,7 +962,12 @@ final class ChargeEngine: ObservableObject {
                 }
                 let message = error?.localizedDescription
                 if self.lowPowerModeError != message { self.lowPowerModeError = message }
+                completion?(error == nil)
             }
+        }
+        HelperInstaller.shared.installIfNeeded { error in
+            if let error { complete(error) }
+            else { HelperClient.shared.setLowPowerMode(on, completion: complete) }
         }
     }
     var launchAtLoginNeedsApproval: Bool {
@@ -931,6 +996,7 @@ final class ChargeEngine: ObservableObject {
     @Published var magsafeLedEnabled: Bool {
         didSet {
             UserDefaults.standard.set(magsafeLedEnabled, forKey: "magsafeLedEnabled")
+            if magsafeLedEnabled && !oldValue { HelperInstaller.shared.allowRetry() }
             releaseMagSafeColorIfNeeded()
         }
     }
@@ -987,6 +1053,10 @@ final class ChargeEngine: ObservableObject {
  /// adapter-restore defense would fight the daemon's cut, and the next
  /// tick would start a second session.
     private var dischargeMirrorEpoch = 0
+    private var dischargeStartPending = false
+    private var observedDischargeID: String?
+    private var calibrationDischargeID: String?
+    private var calibrationDischargeResult: DischargePhase?
     private var smc: AppleSMCClient?
  /// Firmware has a user-writable charging-switch key (CHTE/CH0C): the
  /// adapter keeps powering the machine while charging is off. On
@@ -1077,6 +1147,7 @@ final class ChargeEngine: ObservableObject {
             nativeLimitSupported: nativeLimitSupported,
             independentSwitchAvailable: smc.flatMap { ChargeController(client: $0).chargingKey } != nil)
         if calibrationActive {
+            calibrationDischargeID = d.string(forKey: "calibrationDischargeID")
             let phase = d.string(forKey: "calibrationPhase")
                 .flatMap(CalibrationSession.Phase.init(rawValue:))
             calibration = CalibrationSession(
@@ -1090,23 +1161,10 @@ final class ChargeEngine: ObservableObject {
 
     func start() {
         stop()
- // XPC protocol gate (review round 2, P2-2): an older daemon does not
- // know the setDischarge hardwarePercent selector — discharge would
- // fail silently and auto-discharge would retry every tick. Surface
- // an actionable message instead; the limiter itself is unaffected.
-        HelperClient.shared.version { [weak self] version in
-            DispatchQueue.main.async {
-                guard let self, let version, version < "0.5.3" else { return }
-                self.helperError = "Helper 版本 \(version) 过旧（需要 0.5.3+）：请运行 sudo ./scripts/install-helper.sh 重装后再使用放电功能"
-            }
-        }
- // Push the exit-behavior preference so the daemon knows it before
- // any exit path fires (defaults to restore on the daemon side).
-        HelperClient.shared.setExitRestoresCharging(
-            enabled: !chargeControlMode.controlsCharging || exitRestoresCharging)
+        HelperClient.shared.exitRestoresCharging = !chargeControlMode.controlsCharging || exitRestoresCharging
         if !chargeControlMode.controlsCharging {
             if topUpActive { cancelTopUp() }
-            if calibrationActive { cancelCalibration() }
+            if calibrationActive { endCalibration() }
             // An older build may have left a daemon-owned discharge running.
             pendingDischargeCancellation = true
         }
@@ -1124,11 +1182,16 @@ final class ChargeEngine: ObservableObject {
             forName: NSWorkspace.willSleepNotification, object: nil, queue: .main
         ) { [weak self] _ in
             guard let self, self.chargeControlMode.controlsCharging, self.sleepStopCharging,
+                  !HelperInstaller.shared.needsInstall,
                   let smc = self.smc, ChargeController(client: smc).chargingKey != nil else { return }
-            self.sleepPauseLatch = true
-            NSLog("[ChargeKit] will-sleep: cutting charging (sleep-stop)")
-            HelperClient.shared.setChargingSync(enabled: false)
-            self.recordHistory(.sessionCancelled, "睡眠 · 已切断充电")
+            switch HelperClient.shared.setChargingSync(enabled: false) {
+            case .success:
+                self.sleepPauseLatch = true
+                self.recordHistory(.sessionCancelled, "睡眠 · 已切断充电")
+            case .failure(let error):
+                self.helperError = "睡眠停充失败 · \(error.localizedDescription)"
+                self.recordHistory(.sessionCancelled, "睡眠停充未确认 · \(error.localizedDescription)")
+            }
         }
         wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
@@ -1136,7 +1199,7 @@ final class ChargeEngine: ObservableObject {
             guard let self else { return }
             if self.sleepPauseLatch {
                 NSLog("[ChargeKit] did-wake: releasing sleep-stop latch")
-                self.recordHistory(.sessionStarted, "唤醒 · 恢复充电")
+                self.recordHistory(.sessionStarted, "唤醒 · 恢复充电策略")
             }
             self.sleepPauseLatch = false
             self.resetAdapterProbe()
@@ -1172,6 +1235,7 @@ final class ChargeEngine: ObservableObject {
 
     func startTopUp() {
         guard chargeControlMode.controlsCharging, limitingEnabled, !nativeLimitStallActive else { return }
+        if dischargeStartPending { dischargeMirrorEpoch += 1 }
         if dischargeActive { cancelDischarge() }
         topUpActive = true
         recordHistory(.sessionStarted, "充满一次")
@@ -1185,23 +1249,54 @@ final class ChargeEngine: ObservableObject {
         recordHistory(.sessionCancelled, "取消充满")
     }
 
-    func startDischarge() {
-        guard chargeControlMode.controlsCharging, limitingEnabled else { return }
-        if topUpActive { topUpActive = false }
+    func startDischarge(completion: ((Bool) -> Void)? = nil) {
+        guard chargeControlMode.controlsCharging, limitingEnabled, !dischargeStartPending else {
+            completion?(false)
+            return
+        }
         let floor = targetPercent
+        let epoch = dischargeMirrorEpoch
+        dischargeStartPending = true
+        HelperInstaller.shared.installIfNeeded { [weak self] error in
+            guard let self else { return }
+            self.dischargeStartPending = false
+            if let error {
+                self.helperError = error.localizedDescription
+                completion?(false)
+                return
+            }
+            guard self.limitingEnabled, self.targetPercent == floor,
+                  self.dischargeMirrorEpoch == epoch, !self.calibrationActive else {
+                completion?(false)
+                return
+            }
+            self.beginDischarge(to: floor, completion: completion)
+        }
+    }
+
+    private func beginDischarge(to floor: Int, completion: ((Bool) -> Void)?) {
+        if topUpActive { topUpActive = false }
         recordHistory(.sessionStarted, "放电至 \(floor)%")
  // Optimistic latch so the very next tick does not fight the daemon
  // by restoring the adapter it just cut. Bumping the mirror epoch
  // drops the in-flight poll reply that predates this start (it
  // would otherwise report "inactive" and wipe the latch).
         dischargeMirrorEpoch += 1
+        let epoch = dischargeMirrorEpoch
         dischargeActive = true
         dischargeFloor = floor
         suppressDischargeEvent = false
         dischargeMirrorConfirmed = false
         HelperClient.shared.setDischarge(enabled: true, floorPercent: floor, hardwarePercent: hardwareBatteryPercent) { [weak self] error in
             DispatchQueue.main.async {
-                self?.helperError = error.map { "\($0.localizedDescription)" }
+                if let self, self.dischargeMirrorEpoch == epoch {
+                    self.helperError = error?.localizedDescription
+                    if error != nil && !self.dischargeMirrorConfirmed {
+                        self.dischargeActive = false
+                        self.dischargeFloor = nil
+                    }
+                }
+                completion?(error == nil)
             }
         }
     }
@@ -1246,6 +1341,8 @@ final class ChargeEngine: ObservableObject {
     private func endCalibration() {
         calibrationActive = false
         calibration = CalibrationSession()
+        calibrationDischargeID = nil
+        calibrationDischargeResult = nil
  // A full-charge leg ended — its charge progress must not read as
  // a fresh leg reaching the user's limit.
         chargeLegStartPercent = nil
@@ -1257,6 +1354,7 @@ final class ChargeEngine: ObservableObject {
         d.set(calibration.phase.rawValue, forKey: "calibrationPhase")
         d.set(calibration.fullSince, forKey: "calibrationFullSince")
         d.set(calibration.legConfirmedActive, forKey: "calibrationLegConfirmed")
+        d.set(calibrationDischargeID, forKey: "calibrationDischargeID")
     }
 
  // MARK: schedule control (S7)
@@ -1414,39 +1512,75 @@ final class ChargeEngine: ObservableObject {
         UserDefaults.standard.removeObject(forKey: "actionHistory")
     }
 
-    private func applyScheduled(_ action: ScheduleAction, batteryPercent pct: Double) {
-        guard supportsScheduleAction(action) else { return }
+    private func applyScheduled(_ action: ScheduleAction, batteryPercent pct: Double,
+                                completion: @escaping (Bool) -> Void) {
         if case .setLowPowerMode(let on) = action,
            let target = managedLowPowerModeTarget {
             if on != target {
                 let reason = manualLowPowerMode.target == nil ? "自动规则优先" : "手动设置优先"
                 recordHistory(.scheduledAction, "\(action.historyDetail) · \(reason)")
             }
+            completion(on == target && lowPowerModeEnabled == on)
             return
         }
- // Record the scheduled action before executing it.
-        recordHistory(.scheduledAction, action.historyDetail)
         switch action {
         case .setLimit(let v):
             targetPercent = min(max(v, 50), 100)
         case .dischargeTo(let v):
             limitingEnabled = true
             targetPercent = min(max(v, 50), 100)
-            startDischarge()
+            startDischarge(completion: completion)
+            return
         case .pauseCharging:
- // Limit = current battery: charging and discharging stop
- // (pause-charging semantics). Below the slider floor on purpose —
- // clamping up would resume charging.
-            limitingEnabled = true
-            targetPercent = min(max(Int(pct), 10), 100)
+            pauseChargingForSchedule(batteryPercent: pct, completion: completion)
+            return
         case .topUp:
+            guard !nativeLimitStallActive else { completion(false); return }
             limitingEnabled = true
             startTopUp()
         case .startCalibration:
+            guard !calibrationActive, !nativeLimitStallActive else { completion(false); return }
             limitingEnabled = true
             startCalibration()
         case .setLowPowerMode(let on):
-            requestLowPowerMode(on)
+            guard !lowPowerModeWriteInFlight else { completion(false); return }
+            if lowPowerModeEnabled == on { completion(true) }
+            else { writeLowPowerMode(on, completion: completion) }
+            return
+        }
+        completion(true)
+    }
+
+    private func pauseChargingForSchedule(batteryPercent: Double, completion: @escaping (Bool) -> Void) {
+        guard batteryPercent.isFinite, !sleepPauseLatch, !dischargeActive, !dischargeStartPending,
+              !calibrationActive, !topUpActive,
+              powerSourceSnapshot().internalBatterySource == .external else {
+            completion(false)
+            return
+        }
+        scheduledPauseInFlight = true
+        let finish: (Error?) -> Void = { [weak self] error in
+            guard let self else { return }
+            self.scheduledPauseInFlight = false
+            if let error {
+                self.helperError = "定时停充未确认 · \(error.localizedDescription)"
+                completion(false)
+                return
+            }
+            self.limitingEnabled = true
+            self.targetPercent = Int(min(max(batteryPercent, 10), 100))
+            completion(true)
+        }
+        HelperInstaller.shared.installIfNeeded { [weak self] error in
+            if let error { finish(error); return }
+            guard let self, !self.sleepPauseLatch, !self.dischargeActive, !self.dischargeStartPending,
+                  !self.calibrationActive, !self.topUpActive,
+                  powerSourceSnapshot().internalBatterySource == .external else {
+                self?.scheduledPauseInFlight = false
+                completion(false)
+                return
+            }
+            HelperClient.shared.setCharging(enabled: false, completion: finish)
         }
     }
 
@@ -1457,26 +1591,37 @@ final class ChargeEngine: ObservableObject {
 
     private func evaluateSchedule(batteryPercent: Double) {
         refreshWorkdayCalendarIfNeeded()
+        guard !scheduledActionInFlight else { return }
         let now = Date()
+        let calendar = Calendar.current
+        scheduleRetryAfter = scheduleRetryAfter.filter { $0.value > now }
         let year = WorkdayCalendar.gregorianYear(for: now, calendar: .current)
         let waitingForCalendar = workdayCalendarRegion == .mainlandChina
             && workdayCalendarClient.isLoading(year: year)
             && !workdayCalendarClient.hasCalendar(year: year)
         let eligible = scheduleRules.filter { rule in
             guard supportsScheduleAction(rule.action) else { return false }
+            guard scheduleRetryAfter[rule.id] == nil else { return false }
             if waitingForCalendar, case .weekdays = rule.repeatMode { return false }
             return true
         }
-        let due = schedule.dueRules(
-            eligible, now: now, calendar: .current, workdayCalendar: scheduleWorkdayCalendar)
-        guard !due.isEmpty else { return }
-        for fired in due {
-            applyScheduled(fired.action, batteryPercent: batteryPercent)
-            if !fired.enabled, let i = scheduleRules.firstIndex(where: { $0.id == fired.id }) {
-                scheduleRules[i].enabled = false
+        guard let due = schedule.pendingRules(
+            eligible, now: now, calendar: calendar, workdayCalendar: scheduleWorkdayCalendar
+        ).first, let original = eligible.first(where: { $0.id == due.id }) else { return }
+        scheduledActionInFlight = true
+        applyScheduled(due.action, batteryPercent: batteryPercent) { [weak self] succeeded in
+            guard let self else { return }
+            self.scheduledActionInFlight = false
+            guard let index = self.scheduleRules.firstIndex(of: original) else { return }
+            if succeeded {
+                self.schedule.markFired(due.id, on: now, calendar: calendar)
+                if !due.enabled { self.scheduleRules[index].enabled = false }
+                self.persistScheduleBookkeeping()
+                self.recordHistory(.scheduledAction, due.action.historyDetail)
+            } else {
+                self.scheduleRetryAfter[due.id] = Date().addingTimeInterval(60)
             }
         }
-        persistScheduleBookkeeping()
     }
 
     private func estimateRuntime(batteryPower: Double?, batteryVolts: Double?) -> Double? {
@@ -1501,10 +1646,22 @@ final class ChargeEngine: ObservableObject {
     private func syncMagSafeColor(_ color: UInt8, using smc: AppleSMCClient) {
         guard magsafeLedEnabled, !magSafeReleaseInFlight, let current = try? smc.read(SMCKey("ACLC")),
               let currentColor = current.first else { return }
-        lastMagSafeColor = color
-        if currentColor != color {
+        if currentColor != color, prepareHelperForControl() {
+            lastMagSafeColor = color
             HelperClient.shared.setMagSafeColor(color)
         }
+    }
+
+    private func prepareHelperForControl() -> Bool {
+        let installer = HelperInstaller.shared
+        guard !installer.installInProgress else { return false }
+        if !installer.needsInstall { return true }
+        installer.installIfNeeded { [weak self] error in
+            guard let self else { return }
+            let message = error?.localizedDescription
+            if self.helperError != message { self.helperError = message }
+        }
+        return false
     }
 
     private func releaseMagSafeColorIfNeeded() {
@@ -1531,6 +1688,46 @@ final class ChargeEngine: ObservableObject {
         adapterProbeAttempts = 0
         adapterProbeRetryAfter = 0
         adapterProbeEpoch += 1
+    }
+
+    private func refreshDischargeMirror() {
+        let mirrorEpoch = dischargeMirrorEpoch
+        HelperClient.shared.dischargeStatus { phase, floor, id, error in
+            DispatchQueue.main.async {
+                guard self.dischargeMirrorEpoch == mirrorEpoch else { return }
+                if let error {
+                    self.helperError = error.localizedDescription
+                    return
+                }
+                guard let phase else { return }
+                let wasActive = self.dischargeActive
+                let matchesPreviousSession = id != nil && id == self.observedDischargeID
+                let matchesCalibration = id != nil && id == self.calibrationDischargeID
+                self.dischargeActive = phase.ownsAdapter
+                self.dischargeFloor = phase.ownsAdapter && floor > 0 ? floor : nil
+                if phase.ownsAdapter {
+                    self.dischargeMirrorConfirmed = true
+                    self.observedDischargeID = id
+                    if self.calibrationActive, self.calibration.phase == .discharging,
+                       self.calibrationDischargeID == nil, let id {
+                        self.calibrationDischargeID = id
+                        self.persistCalibration()
+                    }
+                } else if wasActive {
+                    if phase == .reachedFloor, matchesPreviousSession, self.dischargeMirrorConfirmed,
+                       !self.suppressDischargeEvent,
+                       !self.calibrationActive {
+                        self.onEvent?(.dischargeFinished(floor: floor))
+                        self.recordHistory(.sessionCompleted, "放电完成 · 到达 \(floor)%")
+                    } else if !self.calibrationActive, !self.suppressDischargeEvent, phase == .failed {
+                        self.recordHistory(.sessionCancelled, "放电中止 · 适配器已恢复")
+                    }
+                    self.suppressDischargeEvent = false
+                    self.dischargeMirrorConfirmed = false
+                }
+                if matchesCalibration { self.calibrationDischargeResult = phase.result }
+            }
+        }
     }
 
     private func recoverAdapterIfNeeded(_ recovery: SessionRules.ChargeControlMode.AdapterRecovery) {
@@ -1618,7 +1815,6 @@ final class ChargeEngine: ObservableObject {
             batteryPercent: macosPercent)
 
         if !chargeControlMode.controlsCharging {
-            cancelStaleDischargeIfNeeded()
             let adapterEnabled = controller.flatMap { try? $0.isAdapterEnabled() }
             let physicalConnection = SessionRules.wallAttached(dcInVoltage: dcInVoltage)
             let external = powerSources.internalBatterySource == .external
@@ -1631,7 +1827,17 @@ final class ChargeEngine: ObservableObject {
             if powerSources.internalBatterySource != nil || physicalConnection {
                 recordAdapterConnection(external || physicalConnection)
             }
-            recoverAdapterIfNeeded(recovery)
+            if recovery != .none {
+                let installer = HelperInstaller.shared
+                let confirmedCut = adapterEnabled == false
+                if (installer.isInstalled && !installer.needsInstall)
+                    || (confirmedCut && prepareHelperForControl()) {
+                    cancelStaleDischargeIfNeeded()
+                    recoverAdapterIfNeeded(recovery)
+                }
+            } else {
+                recoverAdapterIfNeeded(.none)
+            }
             let pct = macosPercent.map(Double.init) ?? rawPercent ?? 0
             evaluateSchedule(batteryPercent: pct)
             let volts = controller.flatMap { try? $0.batteryVoltage() }
@@ -1766,6 +1972,11 @@ final class ChargeEngine: ObservableObject {
  // Same-day catch-up happens naturally: dueRules sees any
  // occurrence whose time already passed today.
         evaluateSchedule(batteryPercent: pct)
+        let chargingControlRequested = limitingEnabled || heatProtectionEnabled || sleepStopCharging
+            || calibrationActive || dischargeActive
+        let chargingHelperReady = chargingControlRequested && prepareHelperForControl()
+        let canRestorePower = chargingHelperReady || (!adapterOn && prepareHelperForControl())
+            || (!chargingControlRequested && !HelperInstaller.shared.needsInstall)
 
  // Track the daemon-owned discharge session (async; next tick uses it).
  // A true→false mirror transition is a completed drain — but only
@@ -1775,48 +1986,24 @@ final class ChargeEngine: ObservableObject {
  // through its own completed event. Replies predating the latest
  // start/cancel (epoch mismatch) are dropped — they would describe
  // a world that no longer exists.
-        let mirrorEpoch = dischargeMirrorEpoch
-        HelperClient.shared.dischargeState { active, floor, error in
-            DispatchQueue.main.async {
-                guard self.dischargeMirrorEpoch == mirrorEpoch else { return }
-                if let error {
-                    self.helperError = "\(error.localizedDescription)"
-                    return
-                }
-                let wasActive = self.dischargeActive
-                let endedFloor = self.dischargeFloor
-                self.dischargeActive = active
-                self.dischargeFloor = active ? floor : nil
-                if active {
-                    self.dischargeMirrorConfirmed = true
-                    return
-                }
-                if wasActive {
-                    if self.dischargeMirrorConfirmed,
-                       !self.suppressDischargeEvent,
-                       !self.calibrationActive,
-                       let endedFloor
-                    {
-                        self.onEvent?(.dischargeFinished(floor: endedFloor))
-                        self.recordHistory(.sessionCompleted, "放电完成 · 到达 \(endedFloor)%")
-                    }
-                    self.suppressDischargeEvent = false
-                    self.dischargeMirrorConfirmed = false
-                }
-            }
+        let shouldMirrorDischarge = canRestorePower && (limitingEnabled || calibrationActive
+            || dischargeActive || !adapterOn)
+        if shouldMirrorDischarge {
+            refreshDischargeMirror()
         }
 
  // Drive the calibration cycle (charge/dwell legs evaluate here; the
  // discharge leg is daemon-owned and falls into the branch below).
-        if calibrationActive {
+        if calibrationActive, chargingHelperReady {
             if !limitingEnabled { endCalibration() }
             if calibrationActive {
                 let event = calibration.tick(
                     batteryPercent: pct, acAttached: acAttached,
-                    dischargeActive: dischargeActive, now: Date(),
+                    dischargeActive: dischargeActive, dischargeResult: calibrationDischargeResult, now: Date(),
                     config: calibrationConfig)
                 switch event {
                 case .beginDischarge:
+                    dischargeMirrorEpoch += 1
  // No optimistic mirror: the session's 15 s grace absorbs
  // XPC/poll latency and detects a session that never came up.
                     HelperClient.shared.setDischarge(
@@ -1870,7 +2057,7 @@ final class ChargeEngine: ObservableObject {
  // Charging-switch mode never cuts the adapter; if it is off (stale
  // adapter-mode state, an external cut, or a just-finished discharge),
  // restore wall power.
-        if controller.chargingKey != nil, !adapterOn {
+        if controller.chargingKey != nil, !adapterOn, canRestorePower {
             HelperClient.shared.setAdapter(enabled: true) { [weak self] error in
                 DispatchQueue.main.async {
                     self?.helperError = error.map { "\($0.localizedDescription)" }
@@ -1925,7 +2112,7 @@ final class ChargeEngine: ObservableObject {
  // sessions and a heat pause take precedence; the guards already
  // exclude Top Up / calibration, so config.targetPercent here
  // equals the user's limit.
-        if SessionRules.autoDischargeShouldStart(
+        if chargingHelperReady, !dischargeStartPending, !scheduledPauseInFlight, SessionRules.autoDischargeShouldStart(
             enabled: autoDischargeEnabled, limitingEnabled: limitingEnabled,
             acAttached: acAttached, batteryPercent: pct,
             targetPercent: targetPercent,
@@ -1946,7 +2133,8 @@ final class ChargeEngine: ObservableObject {
             batteryVolts: batteryVolts, batteryAmps: batteryAmps,
             runtimeEstimateMinutes: runtimeMinutes,
             chargingEnabled: chargingOn, phase: decision.phase, readError: nil,
-            chargePaused: acAttached && (BatteryInfoReader.chargePaused() ?? false))
+            chargePaused: acAttached && (BatteryInfoReader.chargePaused() ?? false),
+            systemIsCharging: powerSources.isCharging)
 
  // Without wall power the limiter is not actively doing anything and
  // the battery carries the machine — phase labels like "已停在 X%（适配器
@@ -1995,7 +2183,8 @@ final class ChargeEngine: ObservableObject {
 
         prevPhase = newSnapshot.phase
 
-        if controller.chargingKey != nil, decision.chargingOn != chargingOn {
+        if !scheduledPauseInFlight, controller.chargingKey != nil, decision.chargingOn != chargingOn,
+           chargingHelperReady || !chargingControlRequested && decision.chargingOn && canRestorePower {
             let wanted = decision.chargingOn
  // A charging-off transition only applies while wall power is present.
             if wanted || acAttached {
@@ -2004,7 +2193,6 @@ final class ChargeEngine: ObservableObject {
                         self?.helperError = error.map { "\($0.localizedDescription)" }
                     }
                 }
-                newSnapshot.chargingEnabled = wanted
             }
         }
         DispatchQueue.main.async { self.publishSnapshot(newSnapshot) }
@@ -2398,6 +2586,11 @@ private struct AboutView: View {
     }
 
     private func refreshHelperVersion() {
+        guard HelperClient.shared.isConnected else {
+            helperVersion = HelperInstaller.shared.isInstalled ? "已安装，尚未连接" : "未安装"
+            isHelperVersionLoaded = true
+            return
+        }
         HelperClient.shared.version { version in
             DispatchQueue.main.async {
                 helperVersion = version
@@ -2577,13 +2770,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         updateStatusBar(engine.snapshot)
-
- // Ensure the root helper is installed; one-time admin prompt.
-        HelperInstaller.shared.installIfNeeded { error in
-            if let error {
-                NSLog("[ChargeKit] helper install failed: \(error.localizedDescription)")
-            }
-        }
 
         engine.start()
 
@@ -2802,12 +2988,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateStatusBar(_ snapshot: ChargeEngine.Snapshot) {
         guard let button = statusItem.button else { return }
-        let title = snapshot.hasBatteryPercent
-            ? "\(Int(snapshot.batteryPercent))%"
-            : "—%"
+        let batteryPercent = snapshot.hasBatteryPercent && snapshot.batteryPercent.isFinite
+            ? snapshot.batteryPercent : nil
+        let title = batteryPercent.map { "\(Int($0))%" } ?? "—%"
         let lowPowerMode = engine.lowPowerModeEnabled
         let icon = MenuBarStatusIcon(
             phase: snapshot.isDrainingWhileChargeManaged ? .discharging : snapshot.phase,
+            batteryPercent: batteryPercent,
+            systemIsCharging: snapshot.systemIsCharging,
             readFailed: snapshot.readError != nil,
             lowPowerMode: lowPowerMode)
         if icon != lastMenuBarIcon {
