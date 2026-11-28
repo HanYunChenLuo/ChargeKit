@@ -14,8 +14,8 @@ enum SettingsPane: String, CaseIterable {
         switch self {
         case .charging: return "充电"
         case .battery: return "电池"
-        case .schedule: return "定时"
-        case .history: return "历史"
+        case .schedule: return "定时任务"
+        case .history: return "操作历史"
         case .general: return "通用"
         }
     }
@@ -31,56 +31,53 @@ enum SettingsPane: String, CaseIterable {
     }
 
     var windowTitle: String {
-        self == .battery ? "电池信息" : "\(title)设置"
+        switch self {
+        case .battery: return "电池信息"
+        case .schedule, .history: return title
+        default: return "\(title)设置"
+        }
     }
 }
 
-/// Native settings window with a stable toolbar for the app's related panes.
-@MainActor
-final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
-    private let engine: ChargeEngine
-    private let updater: SPUUpdater
-    private let contentController: NSHostingController<SettingsPaneView>
-    private var selectedPane: SettingsPane
+private final class SettingsSelection: ObservableObject {
+    @Published var pane: SettingsPane
 
-    private static let toolbarIdentifier = NSToolbar.Identifier("com.chargekit.settings")
+    init(pane: SettingsPane) {
+        self.pane = pane
+    }
+}
+
+@MainActor
+final class SettingsWindowController: NSWindowController {
+    private let selection: SettingsSelection
     private static let selectedPaneKey = "chargekit.settingsPane"
 
     init(engine: ChargeEngine, updater: SPUUpdater) {
-        self.engine = engine
-        self.updater = updater
         let savedPane = UserDefaults.standard.string(forKey: Self.selectedPaneKey)
             .flatMap(SettingsPane.init(rawValue:))
-        selectedPane = savedPane ?? .charging
+        let selection = SettingsSelection(pane: savedPane ?? .charging)
+        self.selection = selection
 
+        let initialSize = NSSize(width: 700, height: 520)
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 460),
+            contentRect: NSRect(origin: .zero, size: initialSize),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false)
- // macOS System Settings behavior: fixed width, vertical-only resize,
- // and a dimmed zoom button — full screen would force a mode switch
- // (the resolution "jump" observed on this machine), so it is off.
-        window.contentMinSize = NSSize(width: 560, height: 400)
-        window.contentMaxSize = NSSize(width: 560, height: CGFloat.greatestFiniteMagnitude)
+        window.contentMinSize = NSSize(width: 620, height: 400)
         window.standardWindowButton(.zoomButton)?.isEnabled = false
         window.collectionBehavior = [.fullScreenAuxiliary]
         window.isReleasedWhenClosed = false
-        window.title = selectedPane.windowTitle
-        let contentController = NSHostingController(
-            rootView: SettingsPaneView(engine: engine, updater: updater, pane: selectedPane))
-        self.contentController = contentController
-        window.contentViewController = contentController
+        window.title = "ChargeKit 设置"
 
         super.init(window: window)
-
-        let toolbar = NSToolbar(identifier: Self.toolbarIdentifier)
-        toolbar.delegate = self
-        toolbar.displayMode = .iconAndLabel
-        toolbar.allowsUserCustomization = false
-        toolbar.autosavesConfiguration = false
-        window.toolbarStyle = .preference
-        window.toolbar = toolbar
+        let hostingController = NSHostingController(rootView:
+            SettingsNavigationView(engine: engine, updater: updater, selection: selection) { [weak self] pane in
+                self?.showPane(pane)
+            })
+        hostingController.sizingOptions = [.minSize]
+        window.contentViewController = hostingController
+        window.setContentSize(initialSize)
         window.center()
     }
 
@@ -88,77 +85,37 @@ final class SettingsWindowController: NSWindowController, NSToolbarDelegate {
         return nil
     }
 
- // MARK: - toolbar items
-
-    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [Self.segmentIdentifier]
-    }
-
-    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [Self.segmentIdentifier]
-    }
-
-    func toolbar(
-        _ toolbar: NSToolbar,
-        itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
-        willBeInsertedIntoToolbar flag: Bool
-    ) -> NSToolbarItem? {
-        guard itemIdentifier == Self.segmentIdentifier else { return nil }
-
- // A segmented control in the .preference toolbar gives the standard
- // macOS Settings experience: icon + label per segment, native hover
- // highlight, selected state and click-to-switch — no custom drawing.
-        let segmented = NSSegmentedControl()
-        segmented.segmentCount = SettingsPane.allCases.count
-        segmented.segmentStyle = .capsule
-        segmented.trackingMode = .selectOne
-        segmented.target = self
-        segmented.action = #selector(selectSegment(_:))
-        for (index, pane) in SettingsPane.allCases.enumerated() {
-            segmented.setLabel(pane.title, forSegment: index)
-            if let symbol = NSImage(
-                systemSymbolName: pane.symbol,
-                accessibilityDescription: pane.title) {
-                segmented.setImage(symbol, forSegment: index)
-            }
-            segmented.setToolTip(pane.title, forSegment: index)
-        }
-        if let index = SettingsPane.allCases.firstIndex(of: selectedPane) {
-            segmented.setSelected(true, forSegment: index)
-        }
-
-        let item = NSToolbarItem(itemIdentifier: itemIdentifier)
-        item.view = segmented
-        paneControl = segmented
-        return item
-    }
-
-    private static let segmentIdentifier =
-        NSToolbarItem.Identifier("com.chargekit.settings.tabs")
-
-    private weak var paneControl: NSSegmentedControl?
-
-    @objc private func selectSegment(_ sender: NSSegmentedControl) {
-        let index = sender.selectedSegment
-        guard SettingsPane.allCases.indices.contains(index) else { return }
-        showPane(SettingsPane.allCases[index])
-    }
-
     func showPane(_ pane: SettingsPane) {
-        guard pane != selectedPane else { return }
-        selectedPane = pane
+        guard pane != selection.pane else { return }
+        selection.pane = pane
         UserDefaults.standard.set(pane.rawValue, forKey: Self.selectedPaneKey)
-        if let index = SettingsPane.allCases.firstIndex(of: pane) {
-            paneControl?.setSelected(true, forSegment: index)
+    }
+}
+
+private struct SettingsNavigationView: View {
+    let engine: ChargeEngine
+    let updater: SPUUpdater
+    @ObservedObject var selection: SettingsSelection
+    let select: (SettingsPane) -> Void
+
+    var body: some View {
+        HStack(spacing: 0) {
+            List(selection: Binding<SettingsPane?>(
+                get: { selection.pane },
+                set: { if let pane = $0 { select(pane) } })) {
+                    ForEach(SettingsPane.allCases, id: \.self) { pane in
+                        Label(pane.title, systemImage: pane.symbol)
+                            .tag(pane)
+                    }
+                }
+                .listStyle(.sidebar)
+                .frame(width: 150)
+                .accessibilityLabel("设置分类")
+            Divider()
+            SettingsPaneView(engine: engine, updater: updater, pane: selection.pane)
+                .id(selection.pane)
         }
-        guard let window else { return }
-        let frame = window.frame
-        contentController.rootView = SettingsPaneView(engine: engine, updater: updater, pane: pane)
-        window.title = pane.windowTitle
- // Reuse the installed controller and preserve the complete frame.
- // Replacing contentViewController reattaches the host view and can
- // make AppKit recompute its screen-relative origin on toolbar clicks.
-        window.setFrame(frame, display: true)
+        .frame(minWidth: 620, minHeight: 400)
     }
 }
 
@@ -167,6 +124,7 @@ private struct SettingsPaneView: View {
     let updater: SPUUpdater
     let pane: SettingsPane
     @State private var confirmingClearHistory = false
+    @State private var canCheckForUpdates = false
 
  /// Semantic color for the live heat reading: green in the safe band,
  /// orange inside the hysteresis zone, red at/over the threshold.
@@ -181,17 +139,16 @@ private struct SettingsPaneView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if pane != .battery, let error = engine.helperError {
-                Label("助手连接失败：\(error)", systemImage: "exclamationmark.triangle.fill")
-                    .font(.callout)
-                    .foregroundColor(.red)
-                    .padding(.horizontal, 20)
-                    .padding(.top, 16)
-            }
+            Text(pane.windowTitle)
+                .font(.title2.weight(.semibold))
+                .accessibilityAddTraits(.isHeader)
+                .padding(.horizontal, 24)
+                .padding(.top, 18)
+                .padding(.bottom, 12)
+            Divider()
             paneContent
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(minWidth: 560, maxWidth: 560, minHeight: 400)
         .toggleStyle(.switch)
     }
 
@@ -203,7 +160,9 @@ private struct SettingsPaneView: View {
         case .battery:
             BatteryInfoView(
                 info: engine.batteryInfo,
-                telemetry: engine.snapshot.hasTelemetry ? engine.snapshot : nil)
+                snapshot: engine.snapshot,
+                statusText: PopoverView.statusText(for: engine.snapshot, engine: engine),
+                lowPowerMode: engine.lowPowerModeEnabled)
         case .schedule:
             ScheduleSection(engine: engine)
         case .history:
@@ -221,16 +180,27 @@ private struct SettingsPaneView: View {
             Form {
                 Section("充电管理") {
                     if engine.chargeControlMode == .systemManaged {
-                        LabeledContent("充电上限", value: "由 macOS 管理")
-                        Button("打开电池设置", action: openSystemBatterySettings)
-                        Text("需要满电时，可在 macOS 电池菜单选择「立即充满」。")
-                            .foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 8) {
+                            Label("macOS 管理充电上限", systemImage: "battery.100percent")
+                                .font(.headline)
+                            Text("可在系统电池设置调整上限，需要满电时可从 macOS 电池菜单选择「立即充满」。")
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Button(action: openSystemBatterySettings) {
+                                Label("打开电池设置", systemImage: "arrow.up.right")
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                        .padding(.vertical, 4)
                     } else {
                         Text("此 Mac 仅支持电池监控。")
                     }
                 }
+                lowPowerSection
+                adapterSection
             }
             .formStyle(.grouped)
+            .padding(.horizontal, 12)
         }
     }
 
@@ -240,7 +210,7 @@ private struct SettingsPaneView: View {
                 Toggle("限制充电", isOn: $engine.limitingEnabled)
                 if engine.limitingEnabled {
                     SliderRow(
-                        label: "上限",
+                        label: "停止充电电量",
                         value: engine.targetPercent,
                         unit: "%",
                         range: 50...100,
@@ -249,7 +219,7 @@ private struct SettingsPaneView: View {
                         engine.targetPercent = $0
                     }
                     SliderRow(
-                        label: "充电缓冲",
+                        label: "恢复充电缓冲",
                         value: engine.sailBufferPercent,
                         unit: "%",
                         range: 2...15,
@@ -258,6 +228,8 @@ private struct SettingsPaneView: View {
                         engine.sailBufferPercent = $0
                     }
                 }
+                Toggle("按硬件电量执行限充", isOn: $engine.hardwareBatteryPercent)
+                    .help("同时用于电量显示和放电目标。关闭时使用 macOS 电量，读不到时回退到硬件电量。")
             } header: {
                 Text("充电上限")
             } footer: {
@@ -266,15 +238,13 @@ private struct SettingsPaneView: View {
                 }
             }
 
-            Section("充电行为") {
+            Section("睡眠与退出") {
                 Toggle("睡眠时停止充电", isOn: $engine.sleepStopCharging)
                     .help("睡眠期间停止充电，唤醒后按限充规则恢复")
                 Toggle("达到上限前防止睡眠", isOn: $engine.preventSleepUntilLimit)
                     .help("充电期间阻止系统闲置睡眠；达到上限或停止充电后恢复，合盖睡眠不受影响")
-                Toggle("自动放电", isOn: $engine.autoDischargeEnabled)
-                    .help("接电且电量超过上限 2% 以上时，自动放电到上限")
-                Toggle("退出时恢复充电", isOn: $engine.exitRestoresCharging)
-                    .help("开启后 daemon 退出时（关机、重启、卸载）恢复充电和适配器；关闭时保持当前充电状态")
+                Toggle("辅助服务退出时恢复充电", isOn: $engine.exitRestoresCharging)
+                    .help("控制充电辅助服务退出时的充电开关。")
             }
 
             Section("过热保护") {
@@ -308,22 +278,18 @@ private struct SettingsPaneView: View {
                 }
             }
 
-            Section("操作") {
-                if engine.calibrationActive {
-                    Label("校准运行中", systemImage: "arrow.triangle.2.circlepath")
-                        .foregroundColor(.purple)
-                    Button("取消校准") { engine.cancelCalibration() }
-                        .buttonStyle(.borderless)
+            Section("放电与电池校准") {
+                Toggle("自动放电至充电上限", isOn: $engine.autoDischargeEnabled)
+                    .help("开启限充后，接电且电量高于充电上限时，满足条件便自动放电。")
+                if engine.dischargeStartPending {
+                    ProgressView("正在准备放电…")
+                        .controlSize(.small)
+                } else if engine.calibrationActive {
+                    sessionRow("取消校准", icon: "arrow.triangle.2.circlepath", cancel: engine.cancelCalibration)
                 } else if engine.dischargeActive {
-                    Label("放电至 \(engine.dischargeFloor ?? engine.targetPercent)%", systemImage: "arrow.down.circle")
-                        .foregroundColor(.blue)
-                    Button("取消放电") { engine.cancelDischarge() }
-                        .buttonStyle(.borderless)
+                    sessionRow("取消放电", icon: "arrow.down.circle", cancel: engine.cancelDischarge)
                 } else if engine.topUpActive {
-                    Label("充满中 → 100%", systemImage: "bolt.fill")
-                        .foregroundColor(.green)
-                    Button("取消充满") { engine.cancelTopUp() }
-                        .buttonStyle(.borderless)
+                    sessionRow("取消充满", icon: "bolt.fill", cancel: engine.cancelTopUp)
                 } else if !engine.limitingEnabled {
                     Text("开启限充后可使用这些操作。")
                         .font(.caption)
@@ -356,9 +322,21 @@ private struct SettingsPaneView: View {
                         .foregroundColor(.secondary)
                 }
             }
+            lowPowerSection
+            adapterSection
         }
         .formStyle(.grouped)
         .padding(.horizontal, 12)
+    }
+
+    private func sessionRow(_ cancelTitle: String, icon: String, cancel: @escaping () -> Void) -> some View {
+        HStack {
+            Label(PopoverView.statusText(for: engine.snapshot, engine: engine), systemImage: icon)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer()
+            Button(cancelTitle, action: cancel)
+                .buttonStyle(.bordered)
+        }
     }
 
  /// Smart timestamp with seconds: "刚刚" / "15:42:07" (today) /
@@ -385,8 +363,16 @@ private struct SettingsPaneView: View {
     private var historyPane: some View {
         VStack(spacing: 0) {
             if engine.actionHistory.isEmpty {
-                Label("暂无操作记录", systemImage: "clock")
-                    .foregroundStyle(.secondary)
+                VStack(spacing: 8) {
+                    Image(systemName: "clock.arrow.circlepath")
+                        .font(.title2)
+                        .foregroundStyle(.secondary)
+                        .accessibilityHidden(true)
+                    Text("暂无操作记录")
+                        .font(.headline)
+                    Text("充放电、定时任务和电源变化会记录在这里。")
+                        .foregroundStyle(.secondary)
+                }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 List {
@@ -419,6 +405,8 @@ private struct SettingsPaneView: View {
 
                 Divider()
                 HStack {
+                    Text("\(engine.actionHistory.count) 条记录")
+                        .foregroundStyle(.secondary)
                     Spacer()
                     Button("清除历史…") { confirmingClearHistory = true }
                 }
@@ -434,48 +422,59 @@ private struct SettingsPaneView: View {
         }
     }
 
+    private var lowPowerSection: some View {
+        Section {
+            Toggle("低电量模式", isOn: Binding(
+                get: { engine.lowPowerModeSwitchValue },
+                set: { engine.setLowPowerMode($0) }))
+                .disabled(engine.lowPowerModeSwitchBusy)
+            if engine.lowPowerModeNeedsAuthorization {
+                ProgressView("等待管理员授权…").controlSize(.small)
+            } else if engine.lowPowerModeSwitchBusy {
+                ProgressView("正在切换低电量模式…").controlSize(.small)
+            } else if let error = engine.lowPowerModeError {
+                Label("无法切换低电量模式 · \(error)", systemImage: "exclamationmark.circle")
+                    .foregroundStyle(.red)
+            }
+            Toggle("按电量自动切换", isOn: $engine.automaticLowPowerMode)
+            if engine.automaticLowPowerMode {
+                let thresholdRange = LowPowerModePolicy.thresholdRange
+                SliderRow(
+                    label: "自动开启阈值",
+                    value: engine.lowPowerModeThreshold,
+                    unit: "%",
+                    range: Double(thresholdRange.lowerBound)...Double(thresholdRange.upperBound),
+                    step: 1,
+                    showsTickMarks: false,
+                    allowsTextEntry: true
+                ) {
+                    engine.lowPowerModeThreshold = $0
+                }
+            }
+        } header: {
+            Text("低电量模式")
+        } footer: {
+            Text("手动切换优先于自动规则，下次接入电源时恢复自动规则。")
+            if engine.automaticLowPowerMode {
+                Text("使用电池且电量低于阈值时自动开启，接入电源时关闭。")
+            }
+        }
+    }
+
+    private var adapterSection: some View {
+        Section("电源适配器") {
+            Toggle("由 ChargeKit 管理 MagSafe 灯色", isOn: $engine.magsafeLedEnabled)
+                .help("充电时显示橙色，适配器供电且停止充电时显示绿色。关闭后由 macOS 管理。")
+            if let error = engine.helperError {
+                Label(error, systemImage: "exclamationmark.circle")
+                    .foregroundStyle(.red)
+            }
+        }
+    }
+
     private var generalPane: some View {
         Form {
-            Section("硬件") {
-                Toggle("硬件电池百分比", isOn: $engine.hardwareBatteryPercent)
-                    .help("开启后充电限制、航海模式、放电等功能以电池管理系统直报电量为基准；关闭时使用 macOS 显示电量，与系统菜单栏一致，两者最多可相差 7%")
-                Toggle("MagSafe 指示灯", isOn: $engine.magsafeLedEnabled)
-                    .help("到上限变绿、充电中变橙、断电熄灭；睡眠时由系统接管")
-            }
-
-            Section {
-                Toggle("低电量模式", isOn: Binding(
-                    get: { engine.lowPowerModeSwitchValue },
-                    set: { engine.setLowPowerMode($0) }))
-                Toggle("自动低电量模式", isOn: $engine.automaticLowPowerMode)
-                if engine.automaticLowPowerMode {
-                    let thresholdRange = LowPowerModePolicy.thresholdRange
-                    SliderRow(
-                        label: "电量阈值",
-                        value: engine.lowPowerModeThreshold,
-                        unit: "%",
-                        range: Double(thresholdRange.lowerBound)...Double(thresholdRange.upperBound),
-                        step: 1,
-                        showsTickMarks: false,
-                        allowsTextEntry: true
-                    ) {
-                        engine.lowPowerModeThreshold = $0
-                    }
-                }
-                if let error = engine.lowPowerModeError {
-                    Label("无法切换低电量模式：\(error)", systemImage: "exclamationmark.circle")
-                        .foregroundStyle(.secondary)
-                }
-            } header: {
-                Text("节能")
-            } footer: {
-                Text("手动开关立即生效，下次接入电源时恢复自动规则。")
-                if engine.automaticLowPowerMode {
-                    Text("使用电池且电量低于阈值时自动开启，接入电源时关闭。")
-                }
-            }
-
-            Section("系统集成") {
+            Section("启动") {
                 Toggle("登录时启动 ChargeKit", isOn: Binding(
                     get: { engine.launchAtLogin },
                     set: { engine.setLaunchAtLogin($0) }))
@@ -483,7 +482,13 @@ private struct SettingsPaneView: View {
                 if engine.launchAtLoginNeedsApproval {
                     Button("在系统设置中批准") { engine.openLoginItemsSettings() }
                 }
-                Toggle("通知", isOn: $engine.notificationsEnabled)
+                if let error = engine.launchAtLoginError {
+                    Label(error, systemImage: "exclamationmark.circle")
+                        .foregroundStyle(.red)
+                }
+            }
+            Section("通知") {
+                Toggle("充放电事件提醒", isOn: $engine.notificationsEnabled)
                     .help("达到上限、充满、放电或校准完成，以及系统上限阻止充满时提醒")
                 if engine.notificationsEnabled {
                     Button("发送测试通知") {
@@ -492,10 +497,20 @@ private struct SettingsPaneView: View {
                     }
                     .help("发送一条示例通知，验证系统通知权限与横幅图标是否正常")
                 }
+            }
+            Section("软件更新") {
                 Toggle("自动检查更新", isOn: Binding(
                     get: { updater.automaticallyChecksForUpdates },
                     set: { updater.automaticallyChecksForUpdates = $0 }))
-                    .help("定期检查 ChargeKit 新版本并在后台下载；应用菜单中的“检查更新…”始终可用")
+                    .help("定期检查是否有 ChargeKit 新版本")
+                Button("检查更新…") {
+                    guard updater.canCheckForUpdates else { return }
+                    updater.checkForUpdates()
+                }
+                .disabled(!canCheckForUpdates)
+                .onReceive(updater.publisher(for: \.canCheckForUpdates)) { available in
+                    canCheckForUpdates = available
+                }
             }
         }
         .formStyle(.grouped)

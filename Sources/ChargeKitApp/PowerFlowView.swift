@@ -10,7 +10,7 @@ import SwiftUI
 /// hostPower ≈ dcInPower + |batteryPower|(discharging) — both hold by
 /// construction (ChargeEngine computes host = input − battery).
 struct PowerFlowView: View {
-    var dcInPower: Double      // PDTR, W
+    var dcInPower: Double?     // PDTR, W
     var batteryPower: Double?  // B0AV×B0AC, W; + charging / − discharging
     var hostPower: Double?     // system load, W
 
@@ -33,16 +33,19 @@ struct PowerFlowView: View {
             : Color(red: 0.11, green: 0.41, blue: 0.76)
     }
 
-    private var sourceActive: Bool { dcInPower.isFinite && dcInPower > Self.flowFloor }
+    private var sourceActive: Bool {
+        guard let dcInPower else { return false }
+        return dcInPower.isFinite && dcInPower > Self.flowFloor
+    }
 
     private var srcToHost: Double {
-        guard sourceActive else { return 0 }
+        guard sourceActive, let dcInPower, let hostPower, hostPower.isFinite else { return 0 }
         let remainingInput = dcInPower - srcToBatt
-        guard let hostPower, hostPower.isFinite else { return remainingInput }
         return min(max(0, hostPower), remainingInput)
     }
     private var srcToBatt: Double {
-        guard sourceActive, let b = batteryPower, b.isFinite, b > Self.flowFloor else { return 0 }
+        guard sourceActive, let dcInPower, let b = batteryPower, b.isFinite,
+              b > Self.flowFloor else { return 0 }
         return min(b, dcInPower)
     }
     private var battToHost: Double {
@@ -139,9 +142,8 @@ struct PowerFlowView: View {
     }
 
     private var accessibilitySummary: String {
-        let source = dcInPower.isFinite
-            ? String(format: "适配器输入 %.1f 瓦", dcInPower)
-            : "适配器功率不可用"
+        let source = dcInPower.flatMap { $0.isFinite ? String(format: "适配器输入 %.1f 瓦", $0) : nil }
+            ?? "适配器功率不可用"
         let host = hostPower.flatMap { $0.isFinite ? String(format: "主机 %.1f 瓦", $0) : nil } ?? "主机功率不可用"
         let battery: String
         if let value = batteryPower, value.isFinite {

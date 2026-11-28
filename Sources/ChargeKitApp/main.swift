@@ -372,14 +372,21 @@ func powerSourceSnapshot() -> (
 /// measurer layout per publish).
 struct BatteryInfo: Equatable {
     var designCapacitymAh: Int? = nil
+    var fullChargeCapacitymAh: Int? = nil
  /// Apple-reported battery health percent ("MaxCapacity").
     var healthPercent: Int? = nil
     var cycleCount: Int? = nil
     var serial: String? = nil
- /// Negotiated PD contract from AdapterDetails — the adapter's
- /// capability tier, not instantaneous draw (that is dcInPower/PDTR).
+ /// Reported adapter voltage and power rating from AdapterDetails.
     var adapterVolts: Double? = nil
     var adapterWatts: Int? = nil
+    var adapterContractAmps: Double? = nil
+    var adapterProtocol: String? = nil
+
+    var adapterNegotiatedWatts: Double? {
+        guard let adapterVolts, let adapterContractAmps else { return nil }
+        return adapterVolts * adapterContractAmps
+    }
  /// macOS gauge percent (IOPowerSources), shown next to the raw hardware
  /// percent (BUIC) in the battery-info dual-percent row.
     var macosPercent: Int? = nil
@@ -408,8 +415,9 @@ final class BatteryInfoReader {
         let stale = lastFullDump.map { now.timeIntervalSince($0) > 300 } ?? true
         let fullDump = acChanged || stale
         if fullDump, let dict = Self.fullDump() {
-            statics.designCapacitymAh = dict["DesignCapacity"] as? Int
-            statics.healthPercent = dict["MaxCapacity"] as? Int
+            statics.designCapacitymAh = (dict["DesignCapacity"] as? Int).flatMap { $0 > 0 ? $0 : nil }
+            statics.fullChargeCapacitymAh = (dict["AppleRawMaxCapacity"] as? Int).flatMap { $0 > 0 ? $0 : nil }
+            statics.healthPercent = (dict["MaxCapacity"] as? Int).flatMap { (1...100).contains($0) ? $0 : nil }
             statics.cycleCount = dict["CycleCount"] as? Int
             statics.serial = (dict["BatterySerialNumber"] as? String)
                 ?? (dict["BatteryData"] as? [String: Any])?["Serial"] as? String
@@ -421,6 +429,7 @@ final class BatteryInfoReader {
             applyAdapter(adapter, to: &info)
         }
         info.designCapacitymAh = statics.designCapacitymAh
+        info.fullChargeCapacitymAh = statics.fullChargeCapacitymAh
         info.healthPercent = statics.healthPercent
         info.cycleCount = statics.cycleCount
         info.serial = statics.serial
@@ -428,10 +437,18 @@ final class BatteryInfoReader {
     }
 
     private func applyAdapter(_ adapter: [String: Any], to info: inout BatteryInfo) {
-        if let millivolts = adapter["AdapterVoltage"] as? Int {
+        if let millivolts = adapter["AdapterVoltage"] as? Int, millivolts > 0 {
             info.adapterVolts = Double(millivolts) / 1000
         }
         info.adapterWatts = adapter["Watts"] as? Int
+        let description = (adapter["Description"] as? String)?.lowercased() ?? ""
+        let words = description.split { !$0.isLetter && !$0.isNumber }
+        if words.contains("pd") || description.contains("usb power delivery") {
+            info.adapterProtocol = "USB PD"
+            if let milliamps = adapter["Current"] as? Int, milliamps > 0 {
+                info.adapterContractAmps = Double(milliamps) / 1000
+            }
+        }
     }
 
  /// The complete AppleSmartBattery property dictionary.
@@ -689,7 +706,7 @@ final class ChargeEngine: ObservableObject {
  /// stall detector watches the physical value and the battery-info
  /// dual-percent row shows it. nil on read error.
         var hardwareBatteryPercent: Double?
-        var dcInPower: Double = 0
+        var dcInPower: Double?
         var batteryTemp: Double?
  /// Battery power in W: positive = charging, negative = discharging.
  /// nil when the gauge keys are unreadable.
@@ -718,6 +735,9 @@ final class ChargeEngine: ObservableObject {
 
         var hasTelemetry: Bool { readError == nil && hardwareBatteryPercent != nil }
         var hasBatteryPercent: Bool { hasTelemetry || systemBatteryPercent != nil }
+        var liveAdapterPower: Double? { readError == nil ? dcInPower : nil }
+        var liveBatteryPower: Double? { readError == nil ? batteryPower : nil }
+        var liveHostPower: Double? { readError == nil ? hostPower : nil }
 
         var isDrainingWhileChargeManaged: Bool {
             guard let batteryPower, batteryPower < -0.5 else { return false }
@@ -880,6 +900,7 @@ final class ChargeEngine: ObservableObject {
  /// the source of truth (no UserDefaults mirror); `launchAtLogin` is
  /// re-read from SMAppService on every launch.
     @Published var launchAtLogin: Bool
+    @Published private(set) var launchAtLoginError: String?
     @Published private(set) var lowPowerModeEnabled = ProcessInfo.processInfo.isLowPowerModeEnabled
     @Published private var pendingManualLowPowerMode: Bool?
     @Published private(set) var lowPowerModeError: String?
@@ -892,7 +913,8 @@ final class ChargeEngine: ObservableObject {
     @Published var lowPowerModeThreshold: Int {
         didSet { UserDefaults.standard.set(lowPowerModeThreshold, forKey: "lowPowerModeThreshold") }
     }
-    private var lowPowerModeWriteInFlight = false
+    @Published private(set) var lowPowerModeWriteInFlight = false
+    @Published private(set) var lowPowerModeNeedsAuthorization = false
     private var queuedLowPowerMode: Bool?
     private var lastLowPowerModeWrite = -Double.infinity
     private static let manualLowPowerModeKey = "manualLowPowerModeSession"
@@ -906,6 +928,7 @@ final class ChargeEngine: ObservableObject {
     private var managedLowPowerModeTarget: Bool?
 
     var lowPowerModeSwitchValue: Bool { pendingManualLowPowerMode ?? lowPowerModeEnabled }
+    var lowPowerModeSwitchBusy: Bool { pendingManualLowPowerMode != nil || lowPowerModeWriteInFlight }
 
     func setLowPowerMode(_ on: Bool) {
         HelperInstaller.shared.allowRetry()
@@ -933,9 +956,17 @@ final class ChargeEngine: ObservableObject {
         let target = manualLowPowerMode.target ?? LowPowerModePolicy.target(
             enabled: automaticLowPowerMode, source: source,
             batteryPercent: batteryPercent, threshold: lowPowerModeThreshold)
-        if let pending = pendingManualLowPowerMode,
-           (target != nil && target != pending) || (!lowPowerModeWriteInFlight && current == pending) {
-            pendingManualLowPowerMode = nil
+        if let pending = pendingManualLowPowerMode {
+            if target != nil && target != pending {
+                pendingManualLowPowerMode = nil
+            } else if !lowPowerModeWriteInFlight, queuedLowPowerMode == nil {
+                if current == pending {
+                    pendingManualLowPowerMode = nil
+                } else if ProcessInfo.processInfo.systemUptime - lastLowPowerModeWrite >= 3 {
+                    pendingManualLowPowerMode = nil
+                    lowPowerModeError = "macOS 尚未确认切换"
+                }
+            }
         }
         managedLowPowerModeTarget = target
         if let target, queuedLowPowerMode != target { queuedLowPowerMode = nil }
@@ -951,11 +982,13 @@ final class ChargeEngine: ObservableObject {
 
     private func writeLowPowerMode(_ on: Bool, completion: ((Bool) -> Void)? = nil) {
         lowPowerModeWriteInFlight = true
+        lowPowerModeNeedsAuthorization = HelperInstaller.shared.needsInstall
         let complete: (Error?) -> Void = { [weak self] error in
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.lastLowPowerModeWrite = ProcessInfo.processInfo.systemUptime
                 self.lowPowerModeWriteInFlight = false
+                self.lowPowerModeNeedsAuthorization = false
                 if error == nil { self.manualLowPowerMode.didWrite(on) }
                 if error != nil && self.pendingManualLowPowerMode == on {
                     self.pendingManualLowPowerMode = nil
@@ -965,7 +998,8 @@ final class ChargeEngine: ObservableObject {
                 completion?(error == nil)
             }
         }
-        HelperInstaller.shared.installIfNeeded { error in
+        HelperInstaller.shared.installIfNeeded { [weak self] error in
+            self?.lowPowerModeNeedsAuthorization = false
             if let error { complete(error) }
             else { HelperClient.shared.setLowPowerMode(on, completion: complete) }
         }
@@ -981,8 +1015,9 @@ final class ChargeEngine: ObservableObject {
             } else {
                 try SMAppService.mainApp.unregister()
             }
+            launchAtLoginError = nil
         } catch {
-            helperError = "登录项：\(error.localizedDescription)"
+            launchAtLoginError = "无法修改登录项 · \(error.localizedDescription)"
         }
         launchAtLogin = SMAppService.mainApp.status == .enabled
     }
@@ -1053,7 +1088,7 @@ final class ChargeEngine: ObservableObject {
  /// adapter-restore defense would fight the daemon's cut, and the next
  /// tick would start a second session.
     private var dischargeMirrorEpoch = 0
-    private var dischargeStartPending = false
+    @Published private(set) var dischargeStartPending = false
     private var observedDischargeID: String?
     private var calibrationDischargeID: String?
     private var calibrationDischargeResult: DischargePhase?
@@ -1842,7 +1877,7 @@ final class ChargeEngine: ObservableObject {
             evaluateSchedule(batteryPercent: pct)
             let volts = controller.flatMap { try? $0.batteryVoltage() }
             let amps = controller.flatMap { try? $0.batteryCurrent() }
-            let power = controller.flatMap { try? $0.dcInPower() } ?? 0
+            let power = controller.flatMap { try? $0.dcInPower() }.flatMap { $0.isFinite ? $0 : nil }
             let batteryPower = volts.flatMap { v in amps.map { v * $0 } }
             let phase: ChargePhase
             if powerSources.internalBatterySource == .battery {
@@ -1855,7 +1890,8 @@ final class ChargeEngine: ObservableObject {
             publishSnapshot(Snapshot(
                 batteryPercent: pct, hardwareBatteryPercent: rawPercent, dcInPower: power,
                 batteryTemp: controller.flatMap { try? $0.batteryTemp() }, batteryPower: batteryPower,
-                hostPower: batteryPower.map { max(power - $0, 0) }, batteryVolts: volts, batteryAmps: amps,
+                hostPower: power.flatMap { input in batteryPower.map { max(input - $0, 0) } },
+                batteryVolts: volts, batteryAmps: amps,
                 runtimeEstimateMinutes: estimateRuntime(batteryPower: batteryPower, batteryVolts: volts),
                 chargingEnabled: powerSources.isCharging == true, phase: phase,
                 chargePaused: external && powerSources.isCharging == false,
@@ -1877,7 +1913,6 @@ final class ChargeEngine: ObservableObject {
         }
         let pct: Double
         let hardwarePct: Double   // raw BUIC: stall detector + dual-percent row
-        let power: Double
         let temp: Double?  // nil on read failure; policy treats nil as "no heat check"
         let chargingOn: Bool
         let adapterOn: Bool
@@ -1894,7 +1929,6 @@ final class ChargeEngine: ObservableObject {
                 hardware: hardwarePct,
                 macos: macosPercent,
                 useHardware: hardwareBatteryPercent)
-            power = try controller.dcInPower()
             temp = try? controller.batteryTemp()
             chargingOn = try controller.isChargingEnabled()
             adapterOn = try controller.isAdapterEnabled()
@@ -1914,19 +1948,11 @@ final class ChargeEngine: ObservableObject {
  // follows from the energy balance (adapter input charges the battery
  // or runs the machine). Clamped ≥ 0: the two ADCs can disagree by a
  // few percent near zero net flow.
-        let batteryVolts: Double?
-        let batteryAmps: Double?
-        let batteryPower: Double?
-        if let v = try? controller.batteryVoltage(), let i = try? controller.batteryCurrent() {
-            batteryVolts = v
-            batteryAmps = i
-            batteryPower = v * i
-        } else {
-            batteryVolts = nil
-            batteryAmps = nil
-            batteryPower = nil
-        }
-        let hostPower = batteryPower.map { max(power - $0, 0) }
+        let power = (try? controller.dcInPower()).flatMap { $0.isFinite ? $0 : nil }
+        let batteryVolts = try? controller.batteryVoltage()
+        let batteryAmps = try? controller.batteryCurrent()
+        let batteryPower = batteryVolts.flatMap { volts in batteryAmps.map { volts * $0 } }
+        let hostPower = power.flatMap { input in batteryPower.map { max(input - $0, 0) } }
 
  // Runtime estimate: EMA over the live battery power. A missing gauge
  // reading (nil batteryPower) can't feed the filter — reset so a stale
@@ -2410,93 +2436,25 @@ struct PopoverView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Text("电池")
-                        .font(.headline)
-                        .accessibilityAddTraits(.isHeader)
-                    Spacer()
-                    if engine.lowPowerModeEnabled {
-                        Label("低电量模式已开启", systemImage: "leaf.fill")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    BatteryGaugeView(
-                        percent: engine.snapshot.hasBatteryPercent
-                            ? engine.snapshot.batteryPercent : nil,
-                        phase: engine.snapshot.phase,
-                        lowPowerMode: engine.lowPowerModeEnabled)
-                }
+            VStack(alignment: .leading, spacing: 4) {
+                BatteryGaugeView(
+                    percent: engine.snapshot.hasBatteryPercent ? engine.snapshot.batteryPercent : nil,
+                    phase: engine.snapshot.isDrainingWhileChargeManaged ? .discharging : engine.snapshot.phase,
+                    lowPowerMode: engine.lowPowerModeEnabled)
                 Text(statusText)
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-                HStack {
-                    Text("低电量模式")
-                        .accessibilityHidden(true)
-                    Spacer()
-                    Toggle("低电量模式", isOn: Binding(
-                        get: { engine.lowPowerModeSwitchValue },
-                        set: { engine.setLowPowerMode($0) }))
-                        .labelsHidden()
-                }
-                .padding(.top, 4)
             }
+
+            PopoverPowerSummary(snapshot: engine.snapshot, batteryInfo: engine.batteryInfo)
 
             Divider()
 
-            VStack(alignment: .leading, spacing: 10) {
-                if engine.chargeControlMode == .systemManaged {
-                    HStack {
-                        Text("充电上限由 macOS 管理")
-                        Spacer()
-                        Button("打开电池设置", action: openSystemBatterySettings)
-                    }
-                } else if engine.chargeControlMode == .monitoringOnly {
-                    Text("此 Mac 仅支持电池监控")
-                        .foregroundStyle(.secondary)
-                } else {
-                HStack {
-                    Text("限制充电")
-                        .accessibilityHidden(true)
-                    Spacer()
-                    Toggle("限制充电", isOn: $engine.limitingEnabled)
-                        .labelsHidden()
-                }
-                if engine.limitingEnabled {
-                    SliderRow(label: "充电上限", value: engine.targetPercent, unit: "%",
-                              range: 50...100, step: 5) {
-                        engine.targetPercent = $0
-                    }
-                }
-                if engine.calibrationActive {
-                    Button("取消校准") { engine.cancelCalibration() }
-                        .buttonStyle(.bordered)
-                } else if engine.dischargeActive {
-                    Button("取消放电") { engine.cancelDischarge() }
-                        .buttonStyle(.bordered)
-                } else if engine.topUpActive {
-                    Button("取消充满") { engine.cancelTopUp() }
-                        .buttonStyle(.bordered)
-                } else if engine.limitingEnabled {
-                    HStack(spacing: 8) {
-                        Button {
-                            engine.startTopUp()
-                        } label: {
-                            Label("充满一次", systemImage: "bolt.fill")
-                                .frame(maxWidth: .infinity)
-                        }
-                        .disabled(engine.fullChargeLegBlocked)
-                        Button {
-                            engine.startDischarge()
-                        } label: {
-                            Label("放电至 \(engine.targetPercent)%", systemImage: "arrow.down.circle")
-                                .frame(maxWidth: .infinity)
-                        }
-                    }
-                    .buttonStyle(.bordered)
-                }
-                }
+            lowPowerControls
+            chargingControls
+            if let error = engine.helperError {
+                feedback("电源操作未完成 · \(error)", icon: "exclamationmark.circle", color: .red)
             }
 
             Divider()
@@ -2520,109 +2478,98 @@ struct PopoverView: View {
         .frame(width: 320)
         .toggleStyle(.switch)
     }
-}
 
-private struct AboutView: View {
-    let appVersion: String
-    let build: String
-    let showDiagnostics: (String) -> Void
-    @State private var helperVersion: String?
-    @State private var isHelperVersionLoaded = false
-
-    private var displayedHelperVersion: String {
-        guard isHelperVersionLoaded else { return "检测中…" }
-        return helperVersion ?? "未安装或不可用"
-    }
-
-    private var macOSVersion: String {
-        let version = ProcessInfo.processInfo.operatingSystemVersion
-        let patch = version.patchVersion == 0 ? "" : ".\(version.patchVersion)"
-        return "macOS \(version.majorVersion).\(version.minorVersion)\(patch)"
-    }
-
-    private var diagnosticsText: String {
-        """
-        ChargeKit \(appVersion) (Build \(build))
-        Helper \(displayedHelperVersion)
-        \(macOSVersion)
-        """
-    }
-
-    var body: some View {
-        VStack(spacing: 14) {
-            Image(nsImage: NSImage(named: NSImage.applicationIconName) ?? NSImage())
-                .resizable()
-                .frame(width: 76, height: 76)
-                .accessibilityHidden(true)
-
-            VStack(spacing: 4) {
-                Text("ChargeKit")
-                    .font(.title2.weight(.semibold))
-                    .accessibilityAddTraits(.isHeader)
-                Text("版本 \(appVersion) · 构建 \(build)")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
-            }
-
-            Text("MacBook 充电限制工具")
-                .font(.callout)
-                .multilineTextAlignment(.center)
-
-            Divider()
-
-            HStack(spacing: 16) {
-                Link("GitHub 项目", destination: URL(string: "https://github.com/HanYunChenLuo/ChargeKit")!)
-                Spacer()
-                Button("诊断信息…") {
-                    showDiagnostics(diagnosticsText)
+    private var lowPowerControls: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Toggle(isOn: Binding(
+                get: { engine.lowPowerModeSwitchValue },
+                set: { engine.setLowPowerMode($0) })) {
+                    Label("低电量模式", systemImage: "leaf")
                 }
-                .buttonStyle(.bordered)
-            }
-        }
-        .padding(24)
-        .frame(width: 340)
-        .onAppear(perform: refreshHelperVersion)
-    }
-
-    private func refreshHelperVersion() {
-        guard HelperClient.shared.isConnected else {
-            helperVersion = HelperInstaller.shared.isInstalled ? "已安装，尚未连接" : "未安装"
-            isHelperVersionLoaded = true
-            return
-        }
-        HelperClient.shared.version { version in
-            DispatchQueue.main.async {
-                helperVersion = version
-                isHelperVersionLoaded = true
+                .disabled(engine.lowPowerModeSwitchBusy)
+            if engine.lowPowerModeNeedsAuthorization {
+                operationProgress("等待管理员授权…")
+            } else if engine.lowPowerModeSwitchBusy {
+                operationProgress("正在切换低电量模式…")
+            } else if let error = engine.lowPowerModeError {
+                feedback("无法切换低电量模式 · \(error)", icon: "exclamationmark.circle", color: .red)
             }
         }
     }
-}
 
-private struct DiagnosticsView: View {
-    let text: String
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("诊断信息")
-                .font(.headline)
-            ScrollView {
-                Text(text)
-                    .font(.system(.body, design: .monospaced))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+    @ViewBuilder
+    private var chargingControls: some View {
+        switch engine.chargeControlMode {
+        case .systemManaged:
+            HStack(spacing: 6) {
+                Label("macOS 管理充电上限", systemImage: "battery.100percent")
+                Spacer(minLength: 6)
+                Button("电池设置", action: openSystemBatterySettings)
             }
-            HStack {
-                Spacer()
-                Button("关闭") {
-                    NSApp.keyWindow?.performClose(nil)
+        case .monitoringOnly:
+            Label("此 Mac 仅支持电池监控", systemImage: "battery.100percent")
+                .foregroundStyle(.secondary)
+        case .independentSwitch:
+            VStack(alignment: .leading, spacing: 8) {
+                if engine.calibrationActive {
+                    sessionButton("取消校准", action: engine.cancelCalibration)
+                } else if engine.dischargeStartPending {
+                    operationProgress("正在准备放电…")
+                } else if engine.dischargeActive {
+                    sessionButton("取消放电", action: engine.cancelDischarge)
+                } else if engine.topUpActive {
+                    sessionButton("取消充满", action: engine.cancelTopUp)
+                } else {
+                    Toggle("限制充电", isOn: $engine.limitingEnabled)
+                    if engine.limitingEnabled {
+                        SliderRow(label: "充电上限", value: engine.targetPercent, unit: "%",
+                                  range: 50...100, step: 5) {
+                            engine.targetPercent = $0
+                        }
+                        HStack(spacing: 8) {
+                            Button {
+                                engine.startTopUp()
+                            } label: {
+                                Label("充满一次", systemImage: "bolt.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .disabled(engine.fullChargeLegBlocked)
+                            Button {
+                                engine.startDischarge()
+                            } label: {
+                                Label("放电至 \(engine.targetPercent)%", systemImage: "arrow.down.circle")
+                                    .frame(maxWidth: .infinity)
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                    }
                 }
-                    .keyboardShortcut(.cancelAction)
             }
         }
-        .padding(20)
-        .frame(width: 420, height: 300)
+    }
+
+    private func sessionButton(_ title: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: "stop.circle")
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.bordered)
+    }
+
+    private func operationProgress(_ text: String) -> some View {
+        HStack(spacing: 6) {
+            ProgressView().controlSize(.small).accessibilityHidden(true)
+            Text(text)
+        }
+        .font(.callout)
+        .foregroundStyle(.secondary)
+    }
+
+    private func feedback(_ text: String, icon: String, color: Color) -> some View {
+        Label(text, systemImage: icon)
+            .font(.callout)
+            .foregroundStyle(color)
+            .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -2935,11 +2882,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let contentController = NSHostingController(rootView: AboutView(
                 appVersion: version,
                 build: build,
-                showDiagnostics: { [weak self] text in
-                    self?.showDiagnosticsWindow(text)
-                }))
+                showDiagnostics: { [weak self] in self?.showDiagnosticsWindow() },
+                checkForUpdates: { [weak self] in self?.checkForUpdates(nil) }))
             let window = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 340, height: 260),
+                contentRect: NSRect(x: 0, y: 0, width: 380, height: 190),
                 styleMask: [.titled, .closable],
                 backing: .buffered,
                 defer: false)
@@ -2953,24 +2899,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @MainActor
-    private func showDiagnosticsWindow(_ text: String) {
+    private func showDiagnosticsWindow() {
+        let view = DiagnosticsView(makeReport: { [engine] in Self.makeDiagnosticsReport(engine: engine) }) { [weak self] in
+            self?.diagnosticsWindow?.performClose(nil)
+        }
         if diagnosticsWindow == nil {
+            let size = NSSize(width: 520, height: 470)
             let window = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 420, height: 300),
-                styleMask: [.titled, .closable],
+                contentRect: NSRect(origin: .zero, size: size),
+                styleMask: [.titled, .closable, .resizable],
                 backing: .buffered,
                 defer: false)
             window.title = "诊断信息"
             window.isReleasedWhenClosed = false
-            window.contentViewController = NSHostingController(
-                rootView: DiagnosticsView(text: text))
+            let controller = NSHostingController(rootView: view)
+            controller.sizingOptions = [.minSize]
+            window.contentViewController = controller
+            window.setContentSize(size)
+            window.center()
             diagnosticsWindow = window
         } else if let controller = diagnosticsWindow?.contentViewController
             as? NSHostingController<DiagnosticsView> {
-            controller.rootView = DiagnosticsView(text: text)
+            controller.rootView = view
         }
-        diagnosticsWindow?.center()
         diagnosticsWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    @MainActor
+    private static func makeDiagnosticsReport(engine: ChargeEngine) -> DiagnosticsReport {
+        let snapshot = engine.snapshot
+        let installer = HelperInstaller.shared
+        let helperStatus: String
+        if installer.installInProgress {
+            helperStatus = "正在等待授权或安装"
+        } else if !installer.isInstalled {
+            helperStatus = "未安装"
+        } else if installer.needsInstall {
+            helperStatus = "已安装 · 启用特权功能时需更新"
+        } else {
+            helperStatus = HelperClient.shared.isConnected ? "已安装 · App 已建立连接" : "已安装 · 按需启用"
+        }
+        let chargingMode: String
+        switch engine.chargeControlMode {
+        case .systemManaged: chargingMode = "macOS 管理"
+        case .independentSwitch: chargingMode = "ChargeKit 管理"
+        case .monitoringOnly: chargingMode = "仅监控"
+        }
+        let source: String
+        switch snapshot.systemPowerSource ?? powerSourceSnapshot().internalBatterySource {
+        case .external: source = "适配器供电"
+        case .battery: source = "电池供电"
+        case nil: source = "暂不可用"
+        }
+        let percent = snapshot.batteryPercent
+        func watts(_ value: Double?, signed: Bool = false) -> String {
+            guard let value, value.isFinite else { return "暂不可用" }
+            return String(format: signed ? "%+.1f W" : "%.1f W", value)
+        }
+        return DiagnosticsReport(
+            appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—",
+            build: Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "—",
+            helperStatus: helperStatus,
+            chargingMode: chargingMode,
+            batteryLevel: snapshot.hasBatteryPercent && percent.isFinite
+                ? "\(Int(min(max(percent, 0), 100)))%" : "暂不可用",
+            powerSource: source,
+            chargingState: snapshot.readError == nil
+                ? PopoverView.statusText(for: snapshot, engine: engine) : "电池读数暂不可用",
+            lowPowerMode: engine.lowPowerModeEnabled ? "已开启" : "已关闭",
+            adapterInput: watts(snapshot.liveAdapterPower),
+            hostLoad: watts(snapshot.liveHostPower),
+            batteryPower: watts(snapshot.liveBatteryPower, signed: true))
     }
 
     @objc @MainActor

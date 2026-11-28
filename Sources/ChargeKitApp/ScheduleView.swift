@@ -110,21 +110,14 @@ struct ScheduleSection: View {
     var body: some View {
         Form {
             Section {
-                Picker("工作日地区", selection: $engine.workdayCalendarRegion) {
-                    ForEach(WorkdayCalendarRegion.allCases) { region in
-                        Text(region.title).tag(region)
-                    }
-                }
-                .pickerStyle(.menu)
-            } header: {
-                Text("工作日历")
-            } footer: {
-                Text(engine.workdayCalendarStatus)
-            }
-            Section {
                 if engine.scheduleRules.isEmpty {
-                    Text("暂无定时任务")
-                        .foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Label("暂无定时任务", systemImage: "calendar")
+                            .font(.headline)
+                        Text("添加任务后，ChargeKit 会在设定时间执行对应操作。")
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 4)
                 }
                 ForEach(engine.scheduleRules) { rule in
                     ScheduleRuleSummaryRow(
@@ -148,12 +141,24 @@ struct ScheduleSection: View {
                     Label("添加定时任务…", systemImage: "plus")
                 }
             } header: {
-                Text("定时任务")
+                Text("任务列表")
             } footer: {
                 Text("错过的任务会在当天唤醒时补做。")
                 if !engine.chargeControlMode.controlsCharging {
                     Text("当前充电模式仅执行低电量模式任务。")
                 }
+            }
+            Section {
+                Picker("工作日地区", selection: $engine.workdayCalendarRegion) {
+                    ForEach(WorkdayCalendarRegion.allCases) { region in
+                        Text(region.title).tag(region)
+                    }
+                }
+                .pickerStyle(.menu)
+            } header: {
+                Text("工作日历")
+            } footer: {
+                Text(engine.workdayCalendarStatus)
             }
         }
         .formStyle(.grouped)
