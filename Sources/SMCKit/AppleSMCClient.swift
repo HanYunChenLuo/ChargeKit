@@ -162,7 +162,10 @@ public final class AppleSMCClient {
     }
 
     public func read(_ key: SMCKey) throws -> [UInt8] {
-        let info = try keyInfo(key)
+        try read(key, info: keyInfo(key))
+    }
+
+    private func read(_ key: SMCKey, info: SMCKeyInfo) throws -> [UInt8] {
         guard info.dataSize > 0, info.dataSize <= 32 else {
             throw AppleSMCError.keyNotFound(key.fourCC)
         }
@@ -178,7 +181,7 @@ public final class AppleSMCClient {
  /// Typed read; throws if the key's SMC type is not numeric.
     public func readNumeric(_ key: SMCKey) throws -> Double {
         let info = try keyInfo(key)
-        let bytes = try read(key)
+        let bytes = try read(key, info: info)
         return try Self.decode(bytes: bytes, type: info.dataType)
     }
 
